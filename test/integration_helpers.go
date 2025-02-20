@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package test
 
 import (
@@ -8,25 +22,25 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 	"github.com/twitchtv/twirp"
 
+	"github.com/livekit/livekit-server/pkg/config"
+	"github.com/livekit/livekit-server/pkg/routing"
+	"github.com/livekit/livekit-server/pkg/service"
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
+	"github.com/livekit/livekit-server/pkg/testutils"
+	testclient "github.com/livekit/livekit-server/test/client"
+	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
-	"github.com/livekit/protocol/utils"
-
-	"github.com/livekit/livekit-server/pkg/config"
-	serverlogger "github.com/livekit/livekit-server/pkg/logger"
-	"github.com/livekit/livekit-server/pkg/routing"
-	"github.com/livekit/livekit-server/pkg/service"
-	"github.com/livekit/livekit-server/pkg/testutils"
-	testclient "github.com/livekit/livekit-server/test/client"
+	"github.com/livekit/protocol/utils/guid"
 )
 
 const (
 	testApiKey        = "apikey"
-	testApiSecret     = "apiSecret"
+	testApiSecret     = "apiSecretExtendTo32BytesAsThatIsMinimum"
 	testRoom          = "mytestroom"
 	defaultServerPort = 7880
 	secondServerPort  = 8880
@@ -39,14 +53,12 @@ const (
 	// connectTimeout = 5000 * time.Second
 )
 
-var (
-	roomClient livekit.RoomService
-)
+var roomClient livekit.RoomService
 
 func init() {
-	serverlogger.InitFromConfig(config.LoggingConfig{
-		Config: logger.Config{Level: "debug"},
-	})
+	config.InitLoggerFromConfig(&config.DefaultConfig.Logging)
+
+	prometheus.Init("test", livekit.NodeType_SERVER)
 }
 
 func setupSingleNodeTest(name string) (*service.LivekitServer, func()) {
@@ -68,8 +80,8 @@ func setupSingleNodeTest(name string) (*service.LivekitServer, func()) {
 
 func setupMultiNodeTest(name string) (*service.LivekitServer, *service.LivekitServer, func()) {
 	logger.Infow("----------------STARTING TEST----------------", "test", name)
-	s1 := createMultiNodeServer(utils.NewGuid(nodeID1), defaultServerPort)
-	s2 := createMultiNodeServer(utils.NewGuid(nodeID2), secondServerPort)
+	s1 := createMultiNodeServer(guid.New(nodeID1), defaultServerPort)
+	s2 := createMultiNodeServer(guid.New(nodeID2), secondServerPort)
 	go s1.Start()
 	go s2.Start()
 
@@ -136,7 +148,7 @@ func waitUntilConnected(t *testing.T, clients ...*testclient.RTCClient) {
 
 func createSingleNodeServer(configUpdater func(*config.Config)) *service.LivekitServer {
 	var err error
-	conf, err := config.NewConfig("", nil)
+	conf, err := config.NewConfig("", true, nil, nil)
 	if err != nil {
 		panic(fmt.Sprintf("could not create config: %v", err))
 	}
@@ -149,7 +161,7 @@ func createSingleNodeServer(configUpdater func(*config.Config)) *service.Livekit
 	if err != nil {
 		panic(fmt.Sprintf("could not create local node: %v", err))
 	}
-	currentNode.Id = utils.NewGuid(nodeID1)
+	currentNode.SetNodeID(livekit.NodeID(guid.New(nodeID1)))
 
 	s, err := service.InitializeServer(conf, currentNode)
 	if err != nil {
@@ -162,12 +174,12 @@ func createSingleNodeServer(configUpdater func(*config.Config)) *service.Livekit
 
 func createMultiNodeServer(nodeID string, port uint32) *service.LivekitServer {
 	var err error
-	conf, err := config.NewConfig("", nil)
+	conf, err := config.NewConfig("", true, nil, nil)
 	if err != nil {
 		panic(fmt.Sprintf("could not create config: %v", err))
 	}
 	conf.Port = port
-	conf.RTC.UDPPort = port + 1
+	conf.RTC.UDPPort = rtcconfig.PortRange{Start: int(port) + 1}
 	conf.RTC.TCPPort = port + 2
 	conf.Redis.Address = "localhost:6379"
 	conf.Keys = map[string]string{testApiKey: testApiSecret}
@@ -176,7 +188,7 @@ func createMultiNodeServer(nodeID string, port uint32) *service.LivekitServer {
 	if err != nil {
 		panic(err)
 	}
-	currentNode.Id = nodeID
+	currentNode.SetNodeID(livekit.NodeID(nodeID))
 
 	// redis routing and store
 	s, err := service.InitializeServer(conf, currentNode)
@@ -190,13 +202,17 @@ func createMultiNodeServer(nodeID string, port uint32) *service.LivekitServer {
 
 // creates a client and runs against server
 func createRTCClient(name string, port int, opts *testclient.Options) *testclient.RTCClient {
-	token := joinToken(testRoom, name)
+	var customizer func(token *auth.AccessToken, grants *auth.VideoGrant)
+	if opts != nil {
+		customizer = opts.TokenCustomizer
+	}
+	token := joinToken(testRoom, name, customizer)
 	ws, err := testclient.NewWebSocketConn(fmt.Sprintf("ws://localhost:%d", port), token, opts)
 	if err != nil {
 		panic(err)
 	}
 
-	c, err := testclient.NewRTCClient(ws)
+	c, err := testclient.NewRTCClient(ws, opts)
 	if err != nil {
 		panic(err)
 	}
@@ -213,7 +229,7 @@ func createRTCClientWithToken(token string, port int, opts *testclient.Options) 
 		panic(err)
 	}
 
-	c, err := testclient.NewRTCClient(ws)
+	c, err := testclient.NewRTCClient(ws, opts)
 	if err != nil {
 		panic(err)
 	}
@@ -222,18 +238,23 @@ func createRTCClientWithToken(token string, port int, opts *testclient.Options) 
 
 	return c
 }
+
 func redisClient() *redis.Client {
 	return redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",
 	})
 }
 
-func joinToken(room, name string) string {
+func joinToken(room, name string, customFn func(token *auth.AccessToken, grants *auth.VideoGrant)) string {
 	at := auth.NewAccessToken(testApiKey, testApiSecret).
-		AddGrant(&auth.VideoGrant{RoomJoin: true, Room: room}).
 		SetIdentity(name).
 		SetName(name).
 		SetMetadata("metadata" + name)
+	grant := &auth.VideoGrant{RoomJoin: true, Room: room}
+	if customFn != nil {
+		customFn(at, grant)
+	}
+	at.AddGrant(grant)
 	t, err := at.ToJWT()
 	if err != nil {
 		panic(err)

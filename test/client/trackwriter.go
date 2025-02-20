@@ -1,18 +1,32 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package client
 
 import (
 	"context"
 	"io"
 	"os"
-	"strings"
 	"time"
 
-	"github.com/pion/webrtc/v3"
-	"github.com/pion/webrtc/v3/pkg/media"
-	"github.com/pion/webrtc/v3/pkg/media/h264reader"
-	"github.com/pion/webrtc/v3/pkg/media/ivfreader"
-	"github.com/pion/webrtc/v3/pkg/media/oggreader"
+	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
+	"github.com/pion/webrtc/v4/pkg/media/h264reader"
+	"github.com/pion/webrtc/v4/pkg/media/ivfreader"
+	"github.com/pion/webrtc/v4/pkg/media/oggreader"
 
+	"github.com/livekit/livekit-server/pkg/sfu/mime"
 	"github.com/livekit/protocol/logger"
 )
 
@@ -23,7 +37,7 @@ type TrackWriter struct {
 	cancel   context.CancelFunc
 	track    *webrtc.TrackLocalStaticSample
 	filePath string
-	mime     string
+	mime     mime.MimeType
 
 	ogg       *oggreader.OggReader
 	ivfheader *ivfreader.IVFFileHeader
@@ -38,7 +52,7 @@ func NewTrackWriter(ctx context.Context, track *webrtc.TrackLocalStaticSample, f
 		cancel:   cancel,
 		track:    track,
 		filePath: filePath,
-		mime:     track.Codec().MimeType,
+		mime:     mime.NormalizeMimeType(track.Codec().MimeType),
 	}
 }
 
@@ -53,23 +67,25 @@ func (w *TrackWriter) Start() error {
 		return err
 	}
 
-	logger.Debugw("starting track writer",
+	logger.Debugw(
+		"starting track writer",
 		"trackID", w.track.ID(),
-		"mime", w.mime)
+		"mime", w.mime,
+	)
 	switch w.mime {
-	case webrtc.MimeTypeOpus:
+	case mime.MimeTypeOpus:
 		w.ogg, _, err = oggreader.NewWith(file)
 		if err != nil {
 			return err
 		}
 		go w.writeOgg()
-	case webrtc.MimeTypeVP8:
+	case mime.MimeTypeVP8:
 		w.ivf, w.ivfheader, err = ivfreader.NewWith(file)
 		if err != nil {
 			return err
 		}
 		go w.writeVP8()
-	case webrtc.MimeTypeH264:
+	case mime.MimeTypeH264:
 		w.h264, err = h264reader.NewReader(file)
 		if err != nil {
 			return err
@@ -86,11 +102,11 @@ func (w *TrackWriter) Stop() {
 func (w *TrackWriter) writeNull() {
 	defer w.onWriteComplete()
 	sample := media.Sample{Data: []byte{0x0, 0xff, 0xff, 0xff, 0xff}, Duration: 30 * time.Millisecond}
-	h264Sample := media.Sample{Data: []byte{0x5, 0xff, 0xff, 0xff, 0xff}, Duration: 30 * time.Millisecond}
+	h264Sample := media.Sample{Data: []byte{0x00, 0x00, 0x00, 0x01, 0x7, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x8, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x5, 0xff, 0xff, 0xff, 0xff}, Duration: 30 * time.Millisecond}
 	for {
 		select {
 		case <-time.After(20 * time.Millisecond):
-			if strings.EqualFold(w.mime, webrtc.MimeTypeH264) {
+			if w.mime == mime.MimeTypeH264 {
 				w.track.WriteSample(h264Sample)
 			} else {
 				w.track.WriteSample(sample)

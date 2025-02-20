@@ -1,33 +1,53 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package telemetry
 
 import (
 	"context"
 	"sync"
+	"time"
 
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/livekit/livekit-server/pkg/utils"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	protoutils "github.com/livekit/protocol/utils"
 )
 
 // StatsWorker handles participant stats
 type StatsWorker struct {
+	next *StatsWorker
+
 	ctx                 context.Context
-	t                   TelemetryReporter
+	t                   TelemetryService
 	roomID              livekit.RoomID
 	roomName            livekit.RoomName
 	participantID       livekit.ParticipantID
 	participantIdentity livekit.ParticipantIdentity
+	isConnected         bool
 
-	lock             sync.Mutex
+	lock             sync.RWMutex
 	outgoingPerTrack map[livekit.TrackID][]*livekit.AnalyticsStat
 	incomingPerTrack map[livekit.TrackID][]*livekit.AnalyticsStat
+	closedAt         time.Time
 }
 
 func newStatsWorker(
 	ctx context.Context,
-	t TelemetryReporter,
+	t TelemetryService,
 	roomID livekit.RoomID,
 	roomName livekit.RoomName,
 	participantID livekit.ParticipantID,
@@ -56,8 +76,25 @@ func (s *StatsWorker) OnTrackStat(trackID livekit.TrackID, direction livekit.Str
 	s.lock.Unlock()
 }
 
-func (s *StatsWorker) Update() {
-	ts := timestamppb.Now()
+func (s *StatsWorker) ParticipantID() livekit.ParticipantID {
+	return s.participantID
+}
+
+func (s *StatsWorker) SetConnected() {
+	s.lock.Lock()
+	s.isConnected = true
+	s.lock.Unlock()
+}
+
+func (s *StatsWorker) IsConnected() bool {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+
+	return s.isConnected
+}
+
+func (s *StatsWorker) Flush(now time.Time) bool {
+	ts := timestamppb.New(now)
 
 	s.lock.Lock()
 	stats := make([]*livekit.AnalyticsStat, 0, len(s.incomingPerTrack)+len(s.outgoingPerTrack))
@@ -67,13 +104,34 @@ func (s *StatsWorker) Update() {
 
 	outgoingPerTrack := s.outgoingPerTrack
 	s.outgoingPerTrack = make(map[livekit.TrackID][]*livekit.AnalyticsStat)
+
+	closed := !s.closedAt.IsZero() && now.Sub(s.closedAt) > workerCleanupWait
 	s.lock.Unlock()
 
 	stats = s.collectStats(ts, livekit.StreamType_UPSTREAM, incomingPerTrack, stats)
 	stats = s.collectStats(ts, livekit.StreamType_DOWNSTREAM, outgoingPerTrack, stats)
 	if len(stats) > 0 {
-		s.t.Report(s.ctx, stats)
+		s.t.SendStats(s.ctx, stats)
 	}
+
+	return closed
+}
+
+func (s *StatsWorker) Close() bool {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	ok := s.closedAt.IsZero()
+	if ok {
+		s.closedAt = time.Now()
+	}
+	return ok
+}
+
+func (s *StatsWorker) Closed() bool {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return !s.closedAt.IsZero()
 }
 
 func (s *StatsWorker) collectStats(
@@ -83,46 +141,20 @@ func (s *StatsWorker) collectStats(
 	stats []*livekit.AnalyticsStat,
 ) []*livekit.AnalyticsStat {
 	for trackID, analyticsStats := range perTrack {
-		analyticsStat := s.getDeltaStats(analyticsStats, ts, trackID, streamType)
-		if analyticsStat != nil {
-			stats = append(stats, analyticsStat)
+		coalesced := coalesce(analyticsStats)
+		if coalesced == nil {
+			continue
 		}
+
+		coalesced.TimeStamp = ts
+		coalesced.TrackId = string(trackID)
+		coalesced.Kind = streamType
+		coalesced.RoomId = string(s.roomID)
+		coalesced.ParticipantId = string(s.participantID)
+		coalesced.RoomName = string(s.roomName)
+		stats = append(stats, coalesced)
 	}
 	return stats
-}
-
-func (s *StatsWorker) getDeltaStats(
-	stats []*livekit.AnalyticsStat,
-	ts *timestamppb.Timestamp,
-	trackID livekit.TrackID,
-	kind livekit.StreamType,
-) *livekit.AnalyticsStat {
-	// merge all streams stats of track
-	analyticsStat := coalesce(stats)
-	if analyticsStat == nil {
-		return nil
-	}
-
-	s.patch(analyticsStat, ts, trackID, kind)
-	return analyticsStat
-}
-
-func (s *StatsWorker) patch(
-	analyticsStat *livekit.AnalyticsStat,
-	ts *timestamppb.Timestamp,
-	trackID livekit.TrackID,
-	kind livekit.StreamType,
-) {
-	analyticsStat.TimeStamp = ts
-	analyticsStat.TrackId = string(trackID)
-	analyticsStat.Kind = kind
-	analyticsStat.RoomId = string(s.roomID)
-	analyticsStat.ParticipantId = string(s.participantID)
-	analyticsStat.RoomName = string(s.roomName)
-}
-
-func (s *StatsWorker) Close() {
-	s.Update()
 }
 
 // -------------------------------------------------------------------------
@@ -134,7 +166,11 @@ func coalesce(stats []*livekit.AnalyticsStat) *livekit.AnalyticsStat {
 	}
 
 	// find aggregates across streams
-	score := float32(0.0)
+	startTime := time.Time{}
+	endTime := time.Time{}
+	scoreSum := float32(0.0) // used for average
+	minScore := float32(0.0) // min score in batched stats
+	var scores []float32     // used for median
 	maxRtt := uint32(0)
 	maxJitter := uint32(0)
 	coalescedVideoLayers := make(map[int32]*livekit.AnalyticsVideoLayer)
@@ -145,8 +181,28 @@ func coalesce(stats []*livekit.AnalyticsStat) *livekit.AnalyticsStat {
 			continue
 		}
 
-		score += stat.Score
+		// only consider non-zero scores
+		if stat.Score > 0 {
+			if minScore == 0 {
+				minScore = stat.Score
+			} else if stat.Score < minScore {
+				minScore = stat.Score
+			}
+			scoreSum += stat.Score
+			scores = append(scores, stat.Score)
+		}
+
 		for _, analyticsStream := range stat.Streams {
+			start := analyticsStream.StartTime.AsTime()
+			if startTime.IsZero() || startTime.After(start) {
+				startTime = start
+			}
+
+			end := analyticsStream.EndTime.AsTime()
+			if endTime.IsZero() || endTime.Before(end) {
+				endTime = end
+			}
+
 			if analyticsStream.Rtt > maxRtt {
 				maxRtt = analyticsStream.Rtt
 			}
@@ -162,6 +218,7 @@ func coalesce(stats []*livekit.AnalyticsStat) *livekit.AnalyticsStat {
 			coalescedStream.PaddingPackets += analyticsStream.PaddingPackets
 			coalescedStream.PaddingBytes += analyticsStream.PaddingBytes
 			coalescedStream.PacketsLost += analyticsStream.PacketsLost
+			coalescedStream.PacketsOutOfOrder += analyticsStream.PacketsOutOfOrder
 			coalescedStream.Frames += analyticsStream.Frames
 			coalescedStream.Nacks += analyticsStream.Nacks
 			coalescedStream.Plis += analyticsStream.Plis
@@ -170,7 +227,7 @@ func coalesce(stats []*livekit.AnalyticsStat) *livekit.AnalyticsStat {
 			for _, videoLayer := range analyticsStream.VideoLayers {
 				coalescedVideoLayer := coalescedVideoLayers[videoLayer.Layer]
 				if coalescedVideoLayer == nil {
-					coalescedVideoLayer = proto.Clone(videoLayer).(*livekit.AnalyticsVideoLayer)
+					coalescedVideoLayer = protoutils.CloneProto(videoLayer)
 					coalescedVideoLayers[videoLayer.Layer] = coalescedVideoLayer
 				} else {
 					coalescedVideoLayer.Packets += videoLayer.Packets
@@ -180,6 +237,8 @@ func coalesce(stats []*livekit.AnalyticsStat) *livekit.AnalyticsStat {
 			}
 		}
 	}
+	coalescedStream.StartTime = timestamppb.New(startTime)
+	coalescedStream.EndTime = timestamppb.New(endTime)
 	coalescedStream.Rtt = maxRtt
 	coalescedStream.Jitter = maxJitter
 
@@ -192,10 +251,16 @@ func coalesce(stats []*livekit.AnalyticsStat) *livekit.AnalyticsStat {
 		}
 	}
 
-	return &livekit.AnalyticsStat{
-		Score:   score / float32(len(stats)),
-		Streams: []*livekit.AnalyticsStream{coalescedStream},
+	stat := &livekit.AnalyticsStat{
+		MinScore:    minScore,
+		MedianScore: utils.MedianFloat32(scores),
+		Streams:     []*livekit.AnalyticsStream{coalescedStream},
 	}
+	numScores := len(scores)
+	if numScores > 0 {
+		stat.Score = scoreSum / float32(numScores)
+	}
+	return stat
 }
 
 func isValid(stat *livekit.AnalyticsStat) bool {
@@ -207,6 +272,7 @@ func isValid(stat *livekit.AnalyticsStat) bool {
 			int32(analyticsStream.PaddingPackets) < 0 ||
 			int64(analyticsStream.PaddingBytes) < 0 ||
 			int32(analyticsStream.PacketsLost) < 0 ||
+			int32(analyticsStream.PacketsOutOfOrder) < 0 ||
 			int32(analyticsStream.Frames) < 0 ||
 			int32(analyticsStream.Nacks) < 0 ||
 			int32(analyticsStream.Plis) < 0 ||

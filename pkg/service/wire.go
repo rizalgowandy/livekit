@@ -1,54 +1,104 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //go:build wireinject
 // +build wireinject
 
 package service
 
 import (
-	"context"
-	"crypto/tls"
 	"fmt"
 	"os"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/google/wire"
+	"github.com/pion/turn/v4"
 	"github.com/pkg/errors"
+	"github.com/redis/go-redis/v9"
 	"gopkg.in/yaml.v3"
 
-	"github.com/livekit/protocol/auth"
-	"github.com/livekit/protocol/livekit"
-	"github.com/livekit/protocol/logger"
-	"github.com/livekit/protocol/utils"
-	"github.com/livekit/protocol/webhook"
-
+	"github.com/livekit/livekit-server/pkg/agent"
 	"github.com/livekit/livekit-server/pkg/clientconfiguration"
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
+	"github.com/livekit/livekit-server/pkg/sfu"
 	"github.com/livekit/livekit-server/pkg/telemetry"
+	"github.com/livekit/protocol/auth"
+	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
+	redisLiveKit "github.com/livekit/protocol/redis"
+	"github.com/livekit/protocol/rpc"
+	"github.com/livekit/protocol/utils"
+	"github.com/livekit/protocol/webhook"
+	"github.com/livekit/psrpc"
 )
 
 func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*LivekitServer, error) {
 	wire.Build(
+		getNodeID,
 		createRedisClient,
-		createMessageBus,
 		createStore,
 		wire.Bind(new(ServiceStore), new(ObjectStore)),
 		createKeyProvider,
 		createWebhookNotifier,
 		createClientConfiguration,
+		createForwardStats,
 		routing.CreateRouter,
-		getRoomConf,
+		getLimitConf,
+		config.DefaultAPIConfig,
 		wire.Bind(new(routing.MessageRouter), new(routing.Router)),
 		wire.Bind(new(livekit.RoomService), new(*RoomService)),
 		telemetry.NewAnalyticsService,
 		telemetry.NewTelemetryService,
+		getMessageBus,
+		NewIOInfoService,
+		wire.Bind(new(IOClient), new(*IOInfoService)),
+		rpc.NewEgressClient,
+		rpc.NewIngressClient,
+		getEgressStore,
+		NewEgressLauncher,
 		NewEgressService,
-		NewRecordingService,
+		getIngressStore,
+		getIngressConfig,
+		NewIngressService,
+		rpc.NewSIPClient,
+		getSIPStore,
+		getSIPConfig,
+		NewSIPService,
 		NewRoomAllocator,
 		NewRoomService,
 		NewRTCService,
+		NewAgentService,
+		NewAgentDispatchService,
+		agent.NewAgentClient,
+		getAgentStore,
+		getSignalRelayConfig,
+		NewDefaultSignalServer,
+		routing.NewSignalClient,
+		getRoomConfig,
+		routing.NewRoomManagerClient,
+		rpc.NewKeepalivePubSub,
+		getPSRPCConfig,
+		getPSRPCClientParams,
+		rpc.NewTopicFormatter,
+		rpc.NewTypedRoomClient,
+		rpc.NewTypedParticipantClient,
+		rpc.NewTypedAgentDispatchInternalClient,
 		NewLocalRoomManager,
-		newTurnAuthHandler,
-		NewTurnServer,
+		NewTURNAuthHandler,
+		getTURNAuthHandlerFunc,
+		newInProcessTurnServer,
+		utils.NewDefaultTimedVersionGenerator,
 		NewLivekitServer,
 	)
 	return &LivekitServer{}, nil
@@ -57,19 +107,33 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 func InitializeRouter(conf *config.Config, currentNode routing.LocalNode) (routing.Router, error) {
 	wire.Build(
 		createRedisClient,
+		getNodeID,
+		getMessageBus,
+		getSignalRelayConfig,
+		getPSRPCConfig,
+		getPSRPCClientParams,
+		routing.NewSignalClient,
+		getRoomConfig,
+		routing.NewRoomManagerClient,
+		rpc.NewKeepalivePubSub,
 		routing.CreateRouter,
 	)
 
 	return nil, nil
 }
 
+func getNodeID(currentNode routing.LocalNode) livekit.NodeID {
+	return currentNode.NodeID()
+}
+
 func createKeyProvider(conf *config.Config) (auth.KeyProvider, error) {
 	// prefer keyfile if set
 	if conf.KeyFile != "" {
+		var otherFilter os.FileMode = 0007
 		if st, err := os.Stat(conf.KeyFile); err != nil {
 			return nil, err
-		} else if st.Mode().Perm() != 0600 {
-			return nil, fmt.Errorf("key file must have permission set to 600")
+		} else if st.Mode().Perm()&otherFilter != 0000 {
+			return nil, fmt.Errorf("key file others permissions must be set to 0")
 		}
 		f, err := os.Open(conf.KeyFile)
 		if err != nil {
@@ -91,7 +155,7 @@ func createKeyProvider(conf *config.Config) (auth.KeyProvider, error) {
 	return auth.NewFileBasedKeyProviderFromMap(conf.Keys), nil
 }
 
-func createWebhookNotifier(conf *config.Config, provider auth.KeyProvider) (webhook.Notifier, error) {
+func createWebhookNotifier(conf *config.Config, provider auth.KeyProvider) (webhook.QueuedNotifier, error) {
 	wc := conf.WebHook
 	if len(wc.URLs) == 0 {
 		return nil, nil
@@ -101,60 +165,107 @@ func createWebhookNotifier(conf *config.Config, provider auth.KeyProvider) (webh
 		return nil, ErrWebHookMissingAPIKey
 	}
 
-	return webhook.NewNotifier(wc.APIKey, secret, wc.URLs), nil
+	return webhook.NewDefaultNotifier(wc.APIKey, secret, wc.URLs), nil
 }
 
-func createRedisClient(conf *config.Config) (*redis.Client, error) {
-	if !conf.HasRedis() {
+func createRedisClient(conf *config.Config) (redis.UniversalClient, error) {
+	if !conf.Redis.IsConfigured() {
 		return nil, nil
 	}
-
-	logger.Infow("using multi-node routing via redis", "addr", conf.Redis.Address)
-	rcOptions := &redis.Options{
-		Addr:     conf.Redis.Address,
-		Username: conf.Redis.Username,
-		Password: conf.Redis.Password,
-		DB:       conf.Redis.DB,
-	}
-	if conf.Redis.UseTLS {
-		rcOptions = &redis.Options{
-			Addr:     conf.Redis.Address,
-			Username: conf.Redis.Username,
-			Password: conf.Redis.Password,
-			DB:       conf.Redis.DB,
-			TLSConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-			},
-		}
-	}
-	rc := redis.NewClient(rcOptions)
-
-	if err := rc.Ping(context.Background()).Err(); err != nil {
-		err = errors.Wrap(err, "unable to connect to redis")
-		return nil, err
-	}
-
-	return rc, nil
+	return redisLiveKit.GetRedisClient(&conf.Redis)
 }
 
-func createMessageBus(rc *redis.Client) utils.MessageBus {
-	if rc == nil {
-		return nil
-	}
-	return utils.NewRedisMessageBus(rc)
-}
-
-func createStore(rc *redis.Client) ObjectStore {
+func createStore(rc redis.UniversalClient) ObjectStore {
 	if rc != nil {
 		return NewRedisStore(rc)
 	}
 	return NewLocalStore()
 }
 
+func getMessageBus(rc redis.UniversalClient) psrpc.MessageBus {
+	if rc == nil {
+		return psrpc.NewLocalMessageBus()
+	}
+	return psrpc.NewRedisMessageBus(rc)
+}
+
+func getEgressStore(s ObjectStore) EgressStore {
+	switch store := s.(type) {
+	case *RedisStore:
+		return store
+	default:
+		return nil
+	}
+}
+
+func getIngressStore(s ObjectStore) IngressStore {
+	switch store := s.(type) {
+	case *RedisStore:
+		return store
+	default:
+		return nil
+	}
+}
+
+func getAgentStore(s ObjectStore) AgentStore {
+	switch store := s.(type) {
+	case *RedisStore:
+		return store
+	case *LocalStore:
+		return store
+	default:
+		return nil
+	}
+}
+
+func getIngressConfig(conf *config.Config) *config.IngressConfig {
+	return &conf.Ingress
+}
+
+func getSIPStore(s ObjectStore) SIPStore {
+	switch store := s.(type) {
+	case *RedisStore:
+		return store
+	default:
+		return nil
+	}
+}
+
+func getSIPConfig(conf *config.Config) *config.SIPConfig {
+	return &conf.SIP
+}
+
 func createClientConfiguration() clientconfiguration.ClientConfigurationManager {
 	return clientconfiguration.NewStaticClientConfigurationManager(clientconfiguration.StaticConfigurations)
 }
 
-func getRoomConf(config *config.Config) config.RoomConfig {
+func getLimitConf(config *config.Config) config.LimitConfig {
+	return config.Limit
+}
+
+func getRoomConfig(config *config.Config) config.RoomConfig {
 	return config.Room
+}
+
+func getSignalRelayConfig(config *config.Config) config.SignalRelayConfig {
+	return config.SignalRelay
+}
+
+func getPSRPCConfig(config *config.Config) rpc.PSRPCConfig {
+	return config.PSRPC
+}
+
+func getPSRPCClientParams(config rpc.PSRPCConfig, bus psrpc.MessageBus) rpc.ClientParams {
+	return rpc.NewClientParams(config, bus, logger.GetLogger(), rpc.PSRPCMetricsObserver{})
+}
+
+func createForwardStats(conf *config.Config) *sfu.ForwardStats {
+	if conf.RTC.ForwardStats.SummaryInterval == 0 || conf.RTC.ForwardStats.ReportInterval == 0 || conf.RTC.ForwardStats.ReportWindow == 0 {
+		return nil
+	}
+	return sfu.NewForwardStats(conf.RTC.ForwardStats.SummaryInterval, conf.RTC.ForwardStats.ReportInterval, conf.RTC.ForwardStats.ReportWindow)
+}
+
+func newInProcessTurnServer(conf *config.Config, authHandler turn.AuthHandler) (*turn.Server, error) {
+	return NewTurnServer(conf, authHandler, false)
 }

@@ -1,8 +1,22 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package types
 
 type ProtocolVersion int
 
-const DefaultProtocol = 6
+const CurrentProtocol = 15
 
 func (v ProtocolVersion) SupportsPackedStreamId() bool {
 	return v > 0
@@ -46,4 +60,38 @@ func (v ProtocolVersion) SupportsICELite() bool {
 
 func (v ProtocolVersion) SupportsUnpublish() bool {
 	return v > 6
+}
+
+// SupportFastStart - if client supports fast start, server side will send media streams
+// in the first offer
+func (v ProtocolVersion) SupportFastStart() bool {
+	return v > 7
+}
+
+func (v ProtocolVersion) SupportHandlesDisconnectedUpdate() bool {
+	return v > 8
+}
+
+func (v ProtocolVersion) SupportSyncStreamID() bool {
+	return v > 9
+}
+
+func (v ProtocolVersion) SupportsConnectionQualityLost() bool {
+	return v > 10
+}
+
+func (v ProtocolVersion) SupportsAsyncRoomID() bool {
+	return v > 11
+}
+
+func (v ProtocolVersion) SupportsIdentityBasedReconnection() bool {
+	return v > 11
+}
+
+func (v ProtocolVersion) SupportsRegionsInLeaveRequest() bool {
+	return v > 12
+}
+
+func (v ProtocolVersion) SupportsNonErrorSignalResponse() bool {
+	return v > 14
 }

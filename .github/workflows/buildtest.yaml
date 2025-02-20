@@ -1,37 +1,44 @@
+# Copyright 2023 LiveKit, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 name: Test
 
 on:
   workflow_dispatch:
   push:
-    branches: [ master ]
+    branches: [master]
   pull_request:
-    branches: [ master ]
+    branches: [master]
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/cache@v2
+      - uses: actions/checkout@v4
+      - uses: shogo82148/actions-setup-redis@v1
         with:
-          path: |
-            ~/go/pkg/mod
-            ~/go/bin
-            ~/.cache
-          key: livekit-server
-      - uses: shogo82148/actions-setup-redis@v1.10.3
-        with:
-          redis-version: '6.x'
+          redis-version: "6.x"
           auto-start: true
       - run: redis-cli ping
 
       - name: Set up Go
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v5
         with:
-          go-version: 1.17
+          go-version-file: "go.mod"
 
       - name: Set up gotestfmt
-        run: go install github.com/haveyoudebuggedit/gotestfmt/v2/cmd/gotestfmt@latest
+        run: go install github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@v2.4.1
 
       - name: Replace mutexes
         run: |
@@ -44,24 +51,25 @@ jobs:
           go mod tidy
 
       - name: Mage Build
-        uses: magefile/mage-action@v1
+        uses: magefile/mage-action@v3
         with:
           version: latest
           args: build
 
       - name: Static Check
-        uses: dominikh/staticcheck-action@v1.1.0
+        uses: amarpal/staticcheck-action@master
         with:
-          version: "2021.1.1"
+          checks: '["all", "-ST1000", "-ST1003", "-ST1020", "-ST1021", "-ST1022", "-SA1019"]'
+          install-go: false
 
       - name: Test
         run: |
           set -euo pipefail
-          go test -json -v ./... 2>&1 | tee /tmp/gotest.log | gotestfmt
+          MallocNanoZone=0 go test -race -json -v ./... 2>&1 | tee /tmp/gotest.log | gotestfmt
 
       # Upload the original go test log as an artifact for later review.
       - name: Upload test log
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-log

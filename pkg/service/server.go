@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package service
 
 import (
@@ -8,57 +22,70 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"time"
 
-	"github.com/pion/turn/v2"
+	"github.com/pion/turn/v4"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/cors"
-	"github.com/urfave/negroni"
+	"github.com/twitchtv/twirp"
+	"github.com/urfave/negroni/v3"
 	"go.uber.org/atomic"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/livekit/protocol/auth"
+	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/utils/xtwirp"
 
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/version"
-	"github.com/livekit/protocol/auth"
-	"github.com/livekit/protocol/livekit"
-	"github.com/livekit/protocol/logger"
 )
 
 type LivekitServer struct {
-	config        *config.Config
-	egressService *EgressService
-	recService    *RecordingService
-	rtcService    *RTCService
-	httpServer    *http.Server
-	promServer    *http.Server
-	router        routing.Router
-	roomManager   *RoomManager
-	turnServer    *turn.Server
-	currentNode   routing.LocalNode
-	running       atomic.Bool
-	doneChan      chan struct{}
-	closedChan    chan struct{}
+	config       *config.Config
+	ioService    *IOInfoService
+	rtcService   *RTCService
+	agentService *AgentService
+	httpServer   *http.Server
+	promServer   *http.Server
+	router       routing.Router
+	roomManager  *RoomManager
+	signalServer *SignalServer
+	turnServer   *turn.Server
+	currentNode  routing.LocalNode
+	running      atomic.Bool
+	doneChan     chan struct{}
+	closedChan   chan struct{}
 }
 
 func NewLivekitServer(conf *config.Config,
 	roomService livekit.RoomService,
+	agentDispatchService *AgentDispatchService,
 	egressService *EgressService,
-	recService *RecordingService,
+	ingressService *IngressService,
+	sipService *SIPService,
+	ioService *IOInfoService,
 	rtcService *RTCService,
+	agentService *AgentService,
 	keyProvider auth.KeyProvider,
 	router routing.Router,
 	roomManager *RoomManager,
+	signalServer *SignalServer,
 	turnServer *turn.Server,
 	currentNode routing.LocalNode,
 ) (s *LivekitServer, err error) {
 	s = &LivekitServer{
-		config:        conf,
-		egressService: egressService,
-		recService:    recService,
-		rtcService:    rtcService,
-		router:        router,
-		roomManager:   roomManager,
+		config:       conf,
+		ioService:    ioService,
+		rtcService:   rtcService,
+		agentService: agentService,
+		router:       router,
+		roomManager:  roomManager,
+		signalServer: signalServer,
 		// turn server starts automatically
 		turnServer:  turnServer,
 		currentNode: currentNode,
@@ -74,15 +101,29 @@ func NewLivekitServer(conf *config.Config,
 				return true
 			},
 			AllowedHeaders: []string{"*"},
+			// allow preflight to be cached for a day
+			MaxAge: 86400,
 		}),
+		negroni.HandlerFunc(RemoveDoubleSlashes),
 	}
 	if keyProvider != nil {
 		middlewares = append(middlewares, NewAPIKeyAuthMiddleware(keyProvider))
 	}
 
-	roomServer := livekit.NewRoomServiceServer(roomService)
-	egressServer := livekit.NewEgressServer(egressService)
-	recServer := livekit.NewRecordingServiceServer(recService)
+	serverOptions := []interface{}{
+		twirp.WithServerHooks(twirp.ChainHooks(
+			TwirpLogger(),
+			TwirpRequestStatusReporter(),
+		)),
+	}
+	for _, opt := range xtwirp.DefaultServerOptions() {
+		serverOptions = append(serverOptions, opt)
+	}
+	roomServer := livekit.NewRoomServiceServer(roomService, serverOptions...)
+	agentDispatchServer := livekit.NewAgentDispatchServiceServer(agentDispatchService, serverOptions...)
+	egressServer := livekit.NewEgressServer(egressService, serverOptions...)
+	ingressServer := livekit.NewIngressServer(ingressService, serverOptions...)
+	sipServer := livekit.NewSIPServer(sipService, serverOptions...)
 
 	mux := http.NewServeMux()
 	if conf.Development {
@@ -91,29 +132,39 @@ func NewLivekitServer(conf *config.Config,
 		mux.HandleFunc("/debug/goroutine", s.debugGoroutines)
 		mux.HandleFunc("/debug/rooms", s.debugInfo)
 	}
-	mux.Handle(roomServer.PathPrefix(), roomServer)
-	mux.Handle(egressServer.PathPrefix(), egressServer)
-	mux.Handle(recServer.PathPrefix(), recServer)
+
+	xtwirp.RegisterServer(mux, roomServer)
+	xtwirp.RegisterServer(mux, agentDispatchServer)
+	xtwirp.RegisterServer(mux, egressServer)
+	xtwirp.RegisterServer(mux, ingressServer)
+	xtwirp.RegisterServer(mux, sipServer)
 	mux.Handle("/rtc", rtcService)
-	mux.HandleFunc("/rtc/validate", rtcService.Validate)
-	mux.HandleFunc("/", s.healthCheck)
+	rtcService.SetupRoutes(mux)
+	mux.Handle("/agent", agentService)
+	mux.HandleFunc("/", s.defaultHandler)
 
 	s.httpServer = &http.Server{
-		Addr:    fmt.Sprintf(":%d", conf.Port),
 		Handler: configureMiddlewares(mux, middlewares...),
 	}
 
 	if conf.PrometheusPort > 0 {
+		logger.Warnw("prometheus_port is deprecated, please switch prometheus.port instead", nil)
+		conf.Prometheus.Port = conf.PrometheusPort
+	}
+
+	if conf.Prometheus.Port > 0 {
+		promHandler := promhttp.Handler()
+		if conf.Prometheus.Username != "" && conf.Prometheus.Password != "" {
+			protectedHandler := negroni.New()
+			protectedHandler.Use(negroni.HandlerFunc(GenBasicAuthMiddleware(conf.Prometheus.Username, conf.Prometheus.Password)))
+			protectedHandler.UseHandler(promHandler)
+			promHandler = protectedHandler
+		}
 		s.promServer = &http.Server{
-			Addr:    fmt.Sprintf(":%d", conf.PrometheusPort),
-			Handler: promhttp.Handler(),
+			Handler: promHandler,
 		}
 	}
 
-	// clean up old rooms on startup
-	if err = roomManager.CleanupRooms(); err != nil {
-		return
-	}
 	if err = router.RemoveDeadNodes(); err != nil {
 		return
 	}
@@ -122,7 +173,7 @@ func NewLivekitServer(conf *config.Config,
 }
 
 func (s *LivekitServer) Node() *livekit.Node {
-	return s.currentNode
+	return s.currentNode.Clone()
 }
 
 func (s *LivekitServer) HTTPPort() int {
@@ -152,50 +203,81 @@ func (s *LivekitServer) Start() error {
 		return err
 	}
 
-	s.egressService.Start()
-	s.recService.Start()
-
-	// ensure we could listen
-	ln, err := net.Listen("tcp", s.httpServer.Addr)
-	if err != nil {
+	if err := s.ioService.Start(); err != nil {
 		return err
 	}
 
-	if s.promServer != nil {
-		promLn, err := net.Listen("tcp", s.promServer.Addr)
+	addresses := s.config.BindAddresses
+	if addresses == nil {
+		addresses = []string{""}
+	}
+
+	// ensure we could listen
+	listeners := make([]net.Listener, 0)
+	promListeners := make([]net.Listener, 0)
+	for _, addr := range addresses {
+		ln, err := net.Listen("tcp", net.JoinHostPort(addr, strconv.Itoa(int(s.config.Port))))
 		if err != nil {
 			return err
 		}
-		go func() {
-			_ = s.promServer.Serve(promLn)
-		}()
+		listeners = append(listeners, ln)
+
+		if s.promServer != nil {
+			ln, err = net.Listen("tcp", net.JoinHostPort(addr, strconv.Itoa(int(s.config.Prometheus.Port))))
+			if err != nil {
+				return err
+			}
+			promListeners = append(promListeners, ln)
+		}
 	}
 
+	values := []interface{}{
+		"portHttp", s.config.Port,
+		"nodeID", s.currentNode.NodeID(),
+		"nodeIP", s.currentNode.NodeIP(),
+		"version", version.Version,
+	}
+	if s.config.BindAddresses != nil {
+		values = append(values, "bindAddresses", s.config.BindAddresses)
+	}
+	if s.config.RTC.TCPPort != 0 {
+		values = append(values, "rtc.portTCP", s.config.RTC.TCPPort)
+	}
+	if !s.config.RTC.ForceTCP && s.config.RTC.UDPPort.Valid() {
+		values = append(values, "rtc.portUDP", s.config.RTC.UDPPort)
+	} else {
+		values = append(values,
+			"rtc.portICERange", []uint32{s.config.RTC.ICEPortRangeStart, s.config.RTC.ICEPortRangeEnd},
+		)
+	}
+	if s.config.Prometheus.Port != 0 {
+		values = append(values, "portPrometheus", s.config.Prometheus.Port)
+	}
+	if s.config.Region != "" {
+		values = append(values, "region", s.config.Region)
+	}
+	logger.Infow("starting LiveKit server", values...)
+	if runtime.GOOS == "windows" {
+		logger.Infow("Windows detected, capacity management is unavailable")
+	}
+
+	for _, promLn := range promListeners {
+		go s.promServer.Serve(promLn)
+	}
+
+	if err := s.signalServer.Start(); err != nil {
+		return err
+	}
+
+	httpGroup := &errgroup.Group{}
+	for _, ln := range listeners {
+		l := ln
+		httpGroup.Go(func() error {
+			return s.httpServer.Serve(l)
+		})
+	}
 	go func() {
-		values := []interface{}{
-			"addr", s.httpServer.Addr,
-			"nodeID", s.currentNode.Id,
-			"nodeIP", s.currentNode.Ip,
-			"version", version.Version,
-		}
-		if s.config.RTC.TCPPort != 0 {
-			values = append(values, "rtc.portTCP", s.config.RTC.TCPPort)
-		}
-		if !s.config.RTC.ForceTCP && s.config.RTC.UDPPort != 0 {
-			values = append(values, "rtc.portUDP", s.config.RTC.UDPPort)
-		} else {
-			values = append(values,
-				"rtc.portICERange", []uint32{s.config.RTC.ICEPortRangeStart, s.config.RTC.ICEPortRangeEnd},
-			)
-		}
-		if s.config.PrometheusPort != 0 {
-			values = append(values, "portPrometheus", s.config.PrometheusPort)
-		}
-		if s.config.Region != "" {
-			values = append(values, "region", s.config.Region)
-		}
-		logger.Infow("starting LiveKit server", values...)
-		if err := s.httpServer.Serve(ln); err != http.ErrServerClosed {
+		if err := httpGroup.Wait(); err != http.ErrServerClosed {
 			logger.Errorw("could not start server", err)
 			s.Stop(true)
 		}
@@ -220,8 +302,8 @@ func (s *LivekitServer) Start() error {
 	}
 
 	s.roomManager.Stop()
-	s.egressService.Stop()
-	s.recService.Stop()
+	s.signalServer.Stop()
+	s.ioService.Stop()
 
 	close(s.closedChan)
 	return nil
@@ -275,6 +357,14 @@ func (s *LivekitServer) debugInfo(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
+func (s *LivekitServer) defaultHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/" {
+		s.healthCheck(w, r)
+	} else {
+		http.NotFound(w, r)
+	}
+}
+
 func (s *LivekitServer) healthCheck(w http.ResponseWriter, _ *http.Request) {
 	var updatedAt time.Time
 	if s.Node().Stats != nil {
@@ -292,7 +382,7 @@ func (s *LivekitServer) healthCheck(w http.ResponseWriter, _ *http.Request) {
 
 // worker to perform periodic tasks per node
 func (s *LivekitServer) backgroundWorker() {
-	roomTicker := time.NewTicker(30 * time.Second)
+	roomTicker := time.NewTicker(1 * time.Second)
 	defer roomTicker.Stop()
 	for {
 		select {

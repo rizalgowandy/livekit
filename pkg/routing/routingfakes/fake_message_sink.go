@@ -5,7 +5,8 @@ import (
 	"sync"
 
 	"github.com/livekit/livekit-server/pkg/routing"
-	"google.golang.org/protobuf/reflect/protoreflect"
+	"github.com/livekit/protocol/livekit"
+	"google.golang.org/protobuf/proto"
 )
 
 type FakeMessageSink struct {
@@ -13,10 +14,30 @@ type FakeMessageSink struct {
 	closeMutex       sync.RWMutex
 	closeArgsForCall []struct {
 	}
-	WriteMessageStub        func(protoreflect.ProtoMessage) error
+	ConnectionIDStub        func() livekit.ConnectionID
+	connectionIDMutex       sync.RWMutex
+	connectionIDArgsForCall []struct {
+	}
+	connectionIDReturns struct {
+		result1 livekit.ConnectionID
+	}
+	connectionIDReturnsOnCall map[int]struct {
+		result1 livekit.ConnectionID
+	}
+	IsClosedStub        func() bool
+	isClosedMutex       sync.RWMutex
+	isClosedArgsForCall []struct {
+	}
+	isClosedReturns struct {
+		result1 bool
+	}
+	isClosedReturnsOnCall map[int]struct {
+		result1 bool
+	}
+	WriteMessageStub        func(proto.Message) error
 	writeMessageMutex       sync.RWMutex
 	writeMessageArgsForCall []struct {
-		arg1 protoreflect.ProtoMessage
+		arg1 proto.Message
 	}
 	writeMessageReturns struct {
 		result1 error
@@ -52,11 +73,117 @@ func (fake *FakeMessageSink) CloseCalls(stub func()) {
 	fake.CloseStub = stub
 }
 
-func (fake *FakeMessageSink) WriteMessage(arg1 protoreflect.ProtoMessage) error {
+func (fake *FakeMessageSink) ConnectionID() livekit.ConnectionID {
+	fake.connectionIDMutex.Lock()
+	ret, specificReturn := fake.connectionIDReturnsOnCall[len(fake.connectionIDArgsForCall)]
+	fake.connectionIDArgsForCall = append(fake.connectionIDArgsForCall, struct {
+	}{})
+	stub := fake.ConnectionIDStub
+	fakeReturns := fake.connectionIDReturns
+	fake.recordInvocation("ConnectionID", []interface{}{})
+	fake.connectionIDMutex.Unlock()
+	if stub != nil {
+		return stub()
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *FakeMessageSink) ConnectionIDCallCount() int {
+	fake.connectionIDMutex.RLock()
+	defer fake.connectionIDMutex.RUnlock()
+	return len(fake.connectionIDArgsForCall)
+}
+
+func (fake *FakeMessageSink) ConnectionIDCalls(stub func() livekit.ConnectionID) {
+	fake.connectionIDMutex.Lock()
+	defer fake.connectionIDMutex.Unlock()
+	fake.ConnectionIDStub = stub
+}
+
+func (fake *FakeMessageSink) ConnectionIDReturns(result1 livekit.ConnectionID) {
+	fake.connectionIDMutex.Lock()
+	defer fake.connectionIDMutex.Unlock()
+	fake.ConnectionIDStub = nil
+	fake.connectionIDReturns = struct {
+		result1 livekit.ConnectionID
+	}{result1}
+}
+
+func (fake *FakeMessageSink) ConnectionIDReturnsOnCall(i int, result1 livekit.ConnectionID) {
+	fake.connectionIDMutex.Lock()
+	defer fake.connectionIDMutex.Unlock()
+	fake.ConnectionIDStub = nil
+	if fake.connectionIDReturnsOnCall == nil {
+		fake.connectionIDReturnsOnCall = make(map[int]struct {
+			result1 livekit.ConnectionID
+		})
+	}
+	fake.connectionIDReturnsOnCall[i] = struct {
+		result1 livekit.ConnectionID
+	}{result1}
+}
+
+func (fake *FakeMessageSink) IsClosed() bool {
+	fake.isClosedMutex.Lock()
+	ret, specificReturn := fake.isClosedReturnsOnCall[len(fake.isClosedArgsForCall)]
+	fake.isClosedArgsForCall = append(fake.isClosedArgsForCall, struct {
+	}{})
+	stub := fake.IsClosedStub
+	fakeReturns := fake.isClosedReturns
+	fake.recordInvocation("IsClosed", []interface{}{})
+	fake.isClosedMutex.Unlock()
+	if stub != nil {
+		return stub()
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *FakeMessageSink) IsClosedCallCount() int {
+	fake.isClosedMutex.RLock()
+	defer fake.isClosedMutex.RUnlock()
+	return len(fake.isClosedArgsForCall)
+}
+
+func (fake *FakeMessageSink) IsClosedCalls(stub func() bool) {
+	fake.isClosedMutex.Lock()
+	defer fake.isClosedMutex.Unlock()
+	fake.IsClosedStub = stub
+}
+
+func (fake *FakeMessageSink) IsClosedReturns(result1 bool) {
+	fake.isClosedMutex.Lock()
+	defer fake.isClosedMutex.Unlock()
+	fake.IsClosedStub = nil
+	fake.isClosedReturns = struct {
+		result1 bool
+	}{result1}
+}
+
+func (fake *FakeMessageSink) IsClosedReturnsOnCall(i int, result1 bool) {
+	fake.isClosedMutex.Lock()
+	defer fake.isClosedMutex.Unlock()
+	fake.IsClosedStub = nil
+	if fake.isClosedReturnsOnCall == nil {
+		fake.isClosedReturnsOnCall = make(map[int]struct {
+			result1 bool
+		})
+	}
+	fake.isClosedReturnsOnCall[i] = struct {
+		result1 bool
+	}{result1}
+}
+
+func (fake *FakeMessageSink) WriteMessage(arg1 proto.Message) error {
 	fake.writeMessageMutex.Lock()
 	ret, specificReturn := fake.writeMessageReturnsOnCall[len(fake.writeMessageArgsForCall)]
 	fake.writeMessageArgsForCall = append(fake.writeMessageArgsForCall, struct {
-		arg1 protoreflect.ProtoMessage
+		arg1 proto.Message
 	}{arg1})
 	stub := fake.WriteMessageStub
 	fakeReturns := fake.writeMessageReturns
@@ -77,13 +204,13 @@ func (fake *FakeMessageSink) WriteMessageCallCount() int {
 	return len(fake.writeMessageArgsForCall)
 }
 
-func (fake *FakeMessageSink) WriteMessageCalls(stub func(protoreflect.ProtoMessage) error) {
+func (fake *FakeMessageSink) WriteMessageCalls(stub func(proto.Message) error) {
 	fake.writeMessageMutex.Lock()
 	defer fake.writeMessageMutex.Unlock()
 	fake.WriteMessageStub = stub
 }
 
-func (fake *FakeMessageSink) WriteMessageArgsForCall(i int) protoreflect.ProtoMessage {
+func (fake *FakeMessageSink) WriteMessageArgsForCall(i int) proto.Message {
 	fake.writeMessageMutex.RLock()
 	defer fake.writeMessageMutex.RUnlock()
 	argsForCall := fake.writeMessageArgsForCall[i]
@@ -118,6 +245,10 @@ func (fake *FakeMessageSink) Invocations() map[string][][]interface{} {
 	defer fake.invocationsMutex.RUnlock()
 	fake.closeMutex.RLock()
 	defer fake.closeMutex.RUnlock()
+	fake.connectionIDMutex.RLock()
+	defer fake.connectionIDMutex.RUnlock()
+	fake.isClosedMutex.RLock()
+	defer fake.isClosedMutex.RUnlock()
 	fake.writeMessageMutex.RLock()
 	defer fake.writeMessageMutex.RUnlock()
 	copiedInvocations := map[string][][]interface{}{}

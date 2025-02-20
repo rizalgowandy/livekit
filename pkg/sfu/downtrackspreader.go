@@ -1,14 +1,25 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package sfu
 
 import (
-	"runtime"
 	"sync"
 
-	"go.uber.org/atomic"
-
-	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/utils"
 )
 
 type DownTrackSpreaderParams struct {
@@ -19,24 +30,15 @@ type DownTrackSpreaderParams struct {
 type DownTrackSpreader struct {
 	params DownTrackSpreaderParams
 
-	downTrackMu sync.RWMutex
-	downTracks  []TrackSender
-	index       map[livekit.ParticipantID]int
-	free        map[int]struct{}
-	numProcs    int
+	downTrackMu      sync.RWMutex
+	downTracks       map[livekit.ParticipantID]TrackSender
+	downTracksShadow []TrackSender
 }
 
 func NewDownTrackSpreader(params DownTrackSpreaderParams) *DownTrackSpreader {
 	d := &DownTrackSpreader{
 		params:     params,
-		downTracks: make([]TrackSender, 0),
-		index:      make(map[livekit.ParticipantID]int),
-		free:       make(map[int]struct{}),
-		numProcs:   runtime.NumCPU(),
-	}
-
-	if runtime.GOMAXPROCS(0) < d.numProcs {
-		d.numProcs = runtime.GOMAXPROCS(0)
+		downTracks: make(map[livekit.ParticipantID]TrackSender),
 	}
 
 	return d
@@ -45,19 +47,17 @@ func NewDownTrackSpreader(params DownTrackSpreaderParams) *DownTrackSpreader {
 func (d *DownTrackSpreader) GetDownTracks() []TrackSender {
 	d.downTrackMu.RLock()
 	defer d.downTrackMu.RUnlock()
-
-	return d.downTracks
+	return d.downTracksShadow
 }
 
 func (d *DownTrackSpreader) ResetAndGetDownTracks() []TrackSender {
 	d.downTrackMu.Lock()
 	defer d.downTrackMu.Unlock()
 
-	downTracks := d.downTracks
+	downTracks := d.downTracksShadow
 
-	d.index = make(map[livekit.ParticipantID]int)
-	d.free = make(map[int]struct{})
-	d.downTracks = make([]TrackSender, 0)
+	d.downTracks = make(map[livekit.ParticipantID]TrackSender)
+	d.downTracksShadow = nil
 
 	return downTracks
 }
@@ -66,87 +66,53 @@ func (d *DownTrackSpreader) Store(ts TrackSender) {
 	d.downTrackMu.Lock()
 	defer d.downTrackMu.Unlock()
 
-	peerID := ts.PeerID()
-	for idx := range d.free {
-		d.index[peerID] = idx
-		delete(d.free, idx)
-		d.downTracks[idx] = ts
-		return
-	}
-
-	d.index[peerID] = len(d.downTracks)
-	d.downTracks = append(d.downTracks, ts)
+	d.downTracks[ts.SubscriberID()] = ts
+	d.shadowDownTracks()
 }
 
-func (d *DownTrackSpreader) Free(peerID livekit.ParticipantID) {
+func (d *DownTrackSpreader) Free(subscriberID livekit.ParticipantID) {
 	d.downTrackMu.Lock()
 	defer d.downTrackMu.Unlock()
 
-	idx, ok := d.index[peerID]
-	if !ok {
-		return
-	}
-
-	delete(d.index, peerID)
-	d.downTracks[idx] = nil
-	d.free[idx] = struct{}{}
+	delete(d.downTracks, subscriberID)
+	d.shadowDownTracks()
 }
 
-func (d *DownTrackSpreader) HasDownTrack(peerID livekit.ParticipantID) bool {
+func (d *DownTrackSpreader) HasDownTrack(subscriberID livekit.ParticipantID) bool {
 	d.downTrackMu.RLock()
 	defer d.downTrackMu.RUnlock()
 
-	_, ok := d.index[peerID]
+	_, ok := d.downTracks[subscriberID]
 	return ok
 }
 
-func (d *DownTrackSpreader) Broadcast(layer int32, pkt *buffer.ExtPacket) {
-	d.downTrackMu.RLock()
-	downTracks := d.downTracks
-	numFree := len(d.free)
-	d.downTrackMu.RUnlock()
-
-	if d.params.Threshold == 0 || (len(downTracks)-numFree) < d.params.Threshold {
-		// serial - not enough down tracks for parallelization to outweigh overhead
-		for _, dt := range downTracks {
-			if dt != nil {
-				d.writeRTP(layer, dt, pkt)
-			}
-		}
-	} else {
-		// parallel - enables much more efficient multi-core utilization
-		start := atomic.NewUint64(0)
-		end := uint64(len(downTracks))
-
-		// 100µs is enough to amortize the overhead and provide sufficient load balancing.
-		// WriteRTP takes about 50µs on average, so we write to 2 down tracks per loop.
-		step := uint64(2)
-
-		var wg sync.WaitGroup
-		wg.Add(d.numProcs)
-		for p := 0; p < d.numProcs; p++ {
-			go func() {
-				defer wg.Done()
-				for {
-					n := start.Add(step)
-					if n >= end+step {
-						return
-					}
-
-					for i := n - step; i < n && i < end; i++ {
-						if dt := downTracks[i]; dt != nil {
-							d.writeRTP(layer, dt, pkt)
-						}
-					}
-				}
-			}()
-		}
-		wg.Wait()
+func (d *DownTrackSpreader) Broadcast(writer func(TrackSender)) int {
+	downTracks := d.GetDownTracks()
+	if len(downTracks) == 0 {
+		return 0
 	}
+
+	threshold := uint64(d.params.Threshold)
+	if threshold == 0 {
+		threshold = 1000000
+	}
+
+	// 100µs is enough to amortize the overhead and provide sufficient load balancing.
+	// WriteRTP takes about 50µs on average, so we write to 2 down tracks per loop.
+	step := uint64(2)
+	utils.ParallelExec(downTracks, threshold, step, writer)
+	return len(downTracks)
 }
 
-func (d *DownTrackSpreader) writeRTP(layer int32, dt TrackSender, pkt *buffer.ExtPacket) {
-	if err := dt.WriteRTP(pkt, layer); err != nil {
-		d.params.Logger.Errorw("failed writing to down track", err)
+func (d *DownTrackSpreader) DownTrackCount() int {
+	d.downTrackMu.RLock()
+	defer d.downTrackMu.RUnlock()
+	return len(d.downTracksShadow)
+}
+
+func (d *DownTrackSpreader) shadowDownTracks() {
+	d.downTracksShadow = make([]TrackSender, 0, len(d.downTracks))
+	for _, dt := range d.downTracks {
+		d.downTracksShadow = append(d.downTracksShadow, dt)
 	}
 }

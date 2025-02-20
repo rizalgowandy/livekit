@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package service
 
 import (
@@ -8,14 +22,19 @@ import (
 	"github.com/thoas/go-funk"
 
 	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/utils"
 )
 
 // encapsulates CRUD operations for room settings
 type LocalStore struct {
 	// map of roomName => room
-	rooms map[livekit.RoomName]*livekit.Room
+	rooms        map[livekit.RoomName]*livekit.Room
+	roomInternal map[livekit.RoomName]*livekit.RoomInternal
 	// map of roomName => { identity: participant }
 	participants map[livekit.RoomName]map[livekit.ParticipantIdentity]*livekit.ParticipantInfo
+
+	agentDispatches map[livekit.RoomName]map[string]*livekit.AgentDispatch
+	agentJobs       map[livekit.RoomName]map[string]*livekit.Job
 
 	lock       sync.RWMutex
 	globalLock sync.Mutex
@@ -23,47 +42,62 @@ type LocalStore struct {
 
 func NewLocalStore() *LocalStore {
 	return &LocalStore{
-		rooms:        make(map[livekit.RoomName]*livekit.Room),
-		participants: make(map[livekit.RoomName]map[livekit.ParticipantIdentity]*livekit.ParticipantInfo),
-		lock:         sync.RWMutex{},
+		rooms:           make(map[livekit.RoomName]*livekit.Room),
+		roomInternal:    make(map[livekit.RoomName]*livekit.RoomInternal),
+		participants:    make(map[livekit.RoomName]map[livekit.ParticipantIdentity]*livekit.ParticipantInfo),
+		agentDispatches: make(map[livekit.RoomName]map[string]*livekit.AgentDispatch),
+		agentJobs:       make(map[livekit.RoomName]map[string]*livekit.Job),
+		lock:            sync.RWMutex{},
 	}
 }
 
-func (s *LocalStore) StoreRoom(_ context.Context, room *livekit.Room) error {
+func (s *LocalStore) StoreRoom(_ context.Context, room *livekit.Room, internal *livekit.RoomInternal) error {
 	if room.CreationTime == 0 {
-		room.CreationTime = time.Now().Unix()
+		now := time.Now()
+		room.CreationTime = now.Unix()
+		room.CreationTimeMs = now.UnixMilli()
 	}
+	roomName := livekit.RoomName(room.Name)
+
 	s.lock.Lock()
-	s.rooms[livekit.RoomName(room.Name)] = room
+	s.rooms[roomName] = room
+	s.roomInternal[roomName] = internal
 	s.lock.Unlock()
+
 	return nil
 }
 
-func (s *LocalStore) LoadRoom(_ context.Context, name livekit.RoomName) (*livekit.Room, error) {
+func (s *LocalStore) LoadRoom(_ context.Context, roomName livekit.RoomName, includeInternal bool) (*livekit.Room, *livekit.RoomInternal, error) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 
-	room := s.rooms[name]
+	room := s.rooms[roomName]
 	if room == nil {
-		return nil, ErrRoomNotFound
+		return nil, nil, ErrRoomNotFound
 	}
-	return room, nil
+
+	var internal *livekit.RoomInternal
+	if includeInternal {
+		internal = s.roomInternal[roomName]
+	}
+
+	return room, internal, nil
 }
 
-func (s *LocalStore) ListRooms(_ context.Context, names []livekit.RoomName) ([]*livekit.Room, error) {
+func (s *LocalStore) ListRooms(_ context.Context, roomNames []livekit.RoomName) ([]*livekit.Room, error) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 	rooms := make([]*livekit.Room, 0, len(s.rooms))
 	for _, r := range s.rooms {
-		if names == nil || funk.Contains(names, livekit.RoomName(r.Name)) {
+		if roomNames == nil || funk.Contains(roomNames, livekit.RoomName(r.Name)) {
 			rooms = append(rooms, r)
 		}
 	}
 	return rooms, nil
 }
 
-func (s *LocalStore) DeleteRoom(ctx context.Context, name livekit.RoomName) error {
-	room, err := s.LoadRoom(ctx, name)
+func (s *LocalStore) DeleteRoom(ctx context.Context, roomName livekit.RoomName) error {
+	room, _, err := s.LoadRoom(ctx, roomName, false)
 	if err == ErrRoomNotFound {
 		return nil
 	} else if err != nil {
@@ -75,6 +109,9 @@ func (s *LocalStore) DeleteRoom(ctx context.Context, name livekit.RoomName) erro
 
 	delete(s.participants, livekit.RoomName(room.Name))
 	delete(s.rooms, livekit.RoomName(room.Name))
+	delete(s.roomInternal, livekit.RoomName(room.Name))
+	delete(s.agentDispatches, livekit.RoomName(room.Name))
+	delete(s.agentJobs, livekit.RoomName(room.Name))
 	return nil
 }
 
@@ -145,27 +182,102 @@ func (s *LocalStore) DeleteParticipant(_ context.Context, roomName livekit.RoomN
 	return nil
 }
 
-func (s *LocalStore) StoreEgress(_ context.Context, _ *livekit.EgressInfo) error {
-	// redis is required for egress
+func (s *LocalStore) StoreAgentDispatch(ctx context.Context, dispatch *livekit.AgentDispatch) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	clone := utils.CloneProto(dispatch)
+	if clone.State != nil {
+		clone.State.Jobs = nil
+	}
+
+	roomDispatches := s.agentDispatches[livekit.RoomName(dispatch.Room)]
+	if roomDispatches == nil {
+		roomDispatches = make(map[string]*livekit.AgentDispatch)
+		s.agentDispatches[livekit.RoomName(dispatch.Room)] = roomDispatches
+	}
+
+	roomDispatches[clone.Id] = clone
 	return nil
 }
 
-func (s *LocalStore) LoadEgress(_ context.Context, _ string) (*livekit.EgressInfo, error) {
-	// redis is required for egress
-	return nil, ErrEgressNotFound
-}
+func (s *LocalStore) DeleteAgentDispatch(ctx context.Context, dispatch *livekit.AgentDispatch) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
-func (s *LocalStore) ListEgress(_ context.Context, _ livekit.RoomID) ([]*livekit.EgressInfo, error) {
-	// redis is required for egress
-	return nil, nil
-}
+	roomDispatches := s.agentDispatches[livekit.RoomName(dispatch.Room)]
+	if roomDispatches != nil {
+		delete(roomDispatches, dispatch.Id)
+	}
 
-func (s *LocalStore) UpdateEgress(_ context.Context, _ *livekit.EgressInfo) error {
-	// redis is required for egress
 	return nil
 }
 
-func (s *LocalStore) DeleteEgress(_ context.Context, _ *livekit.EgressInfo) error {
-	// redis is required for egress
+func (s *LocalStore) ListAgentDispatches(ctx context.Context, roomName livekit.RoomName) ([]*livekit.AgentDispatch, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	agentDispatches := s.agentDispatches[roomName]
+	if agentDispatches == nil {
+		return nil, nil
+	}
+	agentJobs := s.agentJobs[roomName]
+
+	var js []*livekit.Job
+	if agentJobs != nil {
+		for _, j := range agentJobs {
+			js = append(js, utils.CloneProto(j))
+		}
+	}
+	var ds []*livekit.AgentDispatch
+
+	m := make(map[string]*livekit.AgentDispatch)
+	for _, d := range agentDispatches {
+		clone := utils.CloneProto(d)
+		m[d.Id] = clone
+		ds = append(ds, clone)
+	}
+
+	for _, j := range js {
+		d := m[j.DispatchId]
+		if d != nil {
+			d.State.Jobs = append(d.State.Jobs, utils.CloneProto(j))
+		}
+	}
+
+	return ds, nil
+}
+
+func (s *LocalStore) StoreAgentJob(ctx context.Context, job *livekit.Job) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	clone := utils.CloneProto(job)
+	clone.Room = nil
+	if clone.Participant != nil {
+		clone.Participant = &livekit.ParticipantInfo{
+			Identity: clone.Participant.Identity,
+		}
+	}
+
+	roomJobs := s.agentJobs[livekit.RoomName(job.Room.Name)]
+	if roomJobs == nil {
+		roomJobs = make(map[string]*livekit.Job)
+		s.agentJobs[livekit.RoomName(job.Room.Name)] = roomJobs
+	}
+	roomJobs[clone.Id] = clone
+
+	return nil
+}
+
+func (s *LocalStore) DeleteAgentJob(ctx context.Context, job *livekit.Job) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	roomJobs := s.agentJobs[livekit.RoomName(job.Room.Name)]
+	if roomJobs != nil {
+		delete(roomJobs, job.Id)
+	}
+
 	return nil
 }

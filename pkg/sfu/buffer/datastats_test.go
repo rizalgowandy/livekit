@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package buffer
 
 import (
@@ -5,6 +19,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/livekit/protocol/livekit"
 )
 
 func TestDataStats(t *testing.T) {
@@ -18,7 +35,7 @@ func TestDataStats(t *testing.T) {
 	r.StartTime = nil
 	r.EndTime = nil
 	r.Duration = 0
-	require.Zero(t, *r)
+	require.True(t, proto.Equal(r, &livekit.RTPStats{}))
 
 	stats.Update(100, time.Now().UnixNano())
 	r = stats.ToProtoActive()
@@ -28,7 +45,7 @@ func TestDataStats(t *testing.T) {
 	// wait for window duration
 	time.Sleep(time.Second)
 	r = stats.ToProtoActive()
-	require.Zero(t, *r)
+	require.True(t, proto.Equal(r, &livekit.RTPStats{}))
 	stats.Stop()
 	r = stats.ToProtoAggregateOnly()
 	require.EqualValues(t, 100, r.Bytes)

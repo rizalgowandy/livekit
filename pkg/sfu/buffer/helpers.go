@@ -1,9 +1,22 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package buffer
 
 import (
 	"encoding/binary"
 	"errors"
-	"time"
 
 	"github.com/pion/rtp/codecs"
 
@@ -36,22 +49,23 @@ var (
 */
 type VP8 struct {
 	FirstByte byte
+	S         bool
 
-	PictureIDPresent int
-	PictureID        uint16 /* 8 or 16 bits, picture ID */
-	MBit             bool
+	I         bool
+	M         bool
+	PictureID uint16 /* 7 or 15 bits, picture ID */
 
-	TL0PICIDXPresent int
-	TL0PICIDX        uint8 /* 8 bits temporal level zero index */
+	L         bool
+	TL0PICIDX uint8 /* 8 bits temporal level zero index */
 
 	// Optional Header If either of the T or K bits are set to 1,
 	// the TID/Y/KEYIDX extension field MUST be present.
-	TIDPresent int
-	TID        uint8 /* 2 bits temporal layer idx */
-	Y          uint8
+	T   bool
+	TID uint8 /* 2 bits temporal layer idx */
+	Y   bool
 
-	KEYIDXPresent int
-	KEYIDX        uint8 /* 5 bits of key frame idx */
+	K      bool
+	KEYIDX uint8 /* 5 bits of key frame idx */
 
 	HeaderSize int
 
@@ -66,110 +80,115 @@ func (v *VP8) Unmarshal(payload []byte) error {
 	}
 
 	payloadLen := len(payload)
-
 	if payloadLen < 1 {
 		return errShortPacket
 	}
 
 	idx := 0
 	v.FirstByte = payload[idx]
-	S := payload[idx]&0x10 > 0
+	v.S = payload[idx]&0x10 > 0
 	// Check for extended bit control
 	if payload[idx]&0x80 > 0 {
 		idx++
 		if payloadLen < idx+1 {
 			return errShortPacket
 		}
-		I := payload[idx]&0x80 > 0
-		L := payload[idx]&0x40 > 0
-		T := payload[idx]&0x20 > 0
-		K := payload[idx]&0x10 > 0
-		if L && !T {
+		v.I = payload[idx]&0x80 > 0
+		v.L = payload[idx]&0x40 > 0
+		v.T = payload[idx]&0x20 > 0
+		v.K = payload[idx]&0x10 > 0
+		if v.L && !v.T {
 			return errInvalidPacket
 		}
-		// Check for PictureID
-		if I {
+
+		if v.I {
 			idx++
 			if payloadLen < idx+1 {
 				return errShortPacket
 			}
-			v.PictureIDPresent = 1
 			pid := payload[idx] & 0x7f
-			// Check if m is 1, then Picture ID is 15 bits
-			if payload[idx]&0x80 > 0 {
+			// if m is 1, then Picture ID is 15 bits
+			v.M = payload[idx]&0x80 > 0
+			if v.M {
 				idx++
 				if payloadLen < idx+1 {
 					return errShortPacket
 				}
-				v.MBit = true
 				v.PictureID = binary.BigEndian.Uint16([]byte{pid, payload[idx]})
 			} else {
 				v.PictureID = uint16(pid)
 			}
 		}
-		// Check if TL0PICIDX is present
-		if L {
+
+		if v.L {
 			idx++
 			if payloadLen < idx+1 {
-				return errShortPacket
-			}
-			v.TL0PICIDXPresent = 1
-
-			if idx >= payloadLen {
 				return errShortPacket
 			}
 			v.TL0PICIDX = payload[idx]
 		}
-		if T || K {
+
+		if v.T || v.K {
 			idx++
 			if payloadLen < idx+1 {
 				return errShortPacket
 			}
-			if T {
-				v.TIDPresent = 1
+
+			if v.T {
 				v.TID = (payload[idx] & 0xc0) >> 6
-				v.Y = (payload[idx] & 0x20) >> 5
+				v.Y = (payload[idx] & 0x20) > 0
 			}
-			if K {
-				v.KEYIDXPresent = 1
+
+			if v.K {
 				v.KEYIDX = payload[idx] & 0x1f
 			}
-		}
-		if idx >= payloadLen {
-			return errShortPacket
 		}
 		idx++
 		if payloadLen < idx+1 {
 			return errShortPacket
 		}
+
 		// Check is packet is a keyframe by looking at P bit in vp8 payload
-		v.IsKeyFrame = payload[idx]&0x01 == 0 && S
+		v.IsKeyFrame = payload[idx]&0x01 == 0 && v.S
 	} else {
 		idx++
 		if payloadLen < idx+1 {
 			return errShortPacket
 		}
 		// Check is packet is a keyframe by looking at P bit in vp8 payload
-		v.IsKeyFrame = payload[idx]&0x01 == 0 && S
+		v.IsKeyFrame = payload[idx]&0x01 == 0 && v.S
 	}
 	v.HeaderSize = idx
 	return nil
 }
 
-func (v *VP8) MarshalTo(buf []byte) error {
+func (v *VP8) Marshal() ([]byte, error) {
+	buf := make([]byte, v.HeaderSize)
+	n, err := v.MarshalTo(buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf[:n], err
+}
+
+func (v *VP8) MarshalTo(buf []byte) (int, error) {
 	if len(buf) < v.HeaderSize {
-		return errShortPacket
+		return 0, errShortPacket
 	}
 
 	idx := 0
 	buf[idx] = v.FirstByte
-	if (v.PictureIDPresent + v.TL0PICIDXPresent + v.TIDPresent + v.KEYIDXPresent) != 0 {
+	if v.I || v.L || v.T || v.K {
 		buf[idx] |= 0x80 // X bit
 		idx++
-		buf[idx] = byte(v.PictureIDPresent<<7) | byte(v.TL0PICIDXPresent<<6) | byte(v.TIDPresent<<5) | byte(v.KEYIDXPresent<<4)
+
+		xpos := idx
+		xval := byte(0)
+
 		idx++
-		if v.PictureIDPresent == 1 {
-			if v.MBit {
+		if v.I {
+			xval |= (1 << 7)
+			if v.M {
 				buf[idx] = 0x80 | byte((v.PictureID>>8)&0x7f)
 				buf[idx+1] = byte(v.PictureID & 0xff)
 				idx += 2
@@ -178,29 +197,42 @@ func (v *VP8) MarshalTo(buf []byte) error {
 				idx++
 			}
 		}
-		if v.TL0PICIDXPresent == 1 {
+
+		if v.L {
+			xval |= (1 << 6)
 			buf[idx] = v.TL0PICIDX
 			idx++
 		}
-		if v.TIDPresent == 1 || v.KEYIDXPresent == 1 {
+
+		if v.T || v.K {
 			buf[idx] = 0
-			if v.TIDPresent == 1 {
-				buf[idx] = v.TID<<6 | v.Y<<5
+			if v.T {
+				xval |= (1 << 5)
+				buf[idx] = v.TID << 6
+				if v.Y {
+					buf[idx] |= (1 << 5)
+				}
 			}
-			if v.KEYIDXPresent == 1 {
+
+			if v.K {
+				xval |= (1 << 4)
 				buf[idx] |= v.KEYIDX & 0x1f
 			}
 			idx++
 		}
+
+		buf[xpos] = xval
 	} else {
 		buf[idx] &^= 0x80 // X bit
 		idx++
 	}
 
-	return nil
+	return idx, nil
 }
 
-func VP8PictureIdSizeDiff(mBit1 bool, mBit2 bool) int {
+// -------------------------------------
+
+func VPxPictureIdSizeDiff(mBit1 bool, mBit2 bool) int {
 	if mBit1 == mBit2 {
 		return 0
 	}
@@ -212,10 +244,12 @@ func VP8PictureIdSizeDiff(mBit1 bool, mBit2 bool) int {
 	return -1
 }
 
-// IsH264Keyframe detects if h264 payload is a keyframe
+// -------------------------------------
+
+// IsH264KeyFrame detects if h264 payload is a keyframe
 // this code was taken from https://github.com/jech/galene/blob/codecs/rtpconn/rtpreader.go#L45
 // all credits belongs to Juliusz Chroboczek @jech and the awesome Galene SFU
-func IsH264Keyframe(payload []byte) bool {
+func IsH264KeyFrame(payload []byte) bool {
 	if len(payload) < 1 {
 		return false
 	}
@@ -225,7 +259,7 @@ func IsH264Keyframe(payload []byte) bool {
 		return false
 	} else if nalu <= 23 {
 		// simple NALU
-		return nalu == 5
+		return nalu == 7
 	} else if nalu == 24 || nalu == 25 || nalu == 26 || nalu == 27 {
 		// STAP-A, STAP-B, MTAP16 or MTAP24
 		i := 1
@@ -279,10 +313,12 @@ func IsH264Keyframe(payload []byte) bool {
 	return false
 }
 
-// IsAV1Keyframe detects if vp9 payload is a keyframe
+// -------------------------------------
+
+// IsVP9KeyFrame detects if vp9 payload is a keyframe
 // taken from https://github.com/jech/galene/blob/master/codecs/codecs.go
 // all credits belongs to Juliusz Chroboczek @jech and the awesome Galene SFU
-func IsVp9Keyframe(payload []byte) bool {
+func IsVP9KeyFrame(payload []byte) bool {
 	var vp9 codecs.VP9Packet
 	_, err := vp9.Unmarshal(payload)
 	if err != nil || len(vp9.Payload) < 1 {
@@ -303,10 +339,12 @@ func IsVp9Keyframe(payload []byte) bool {
 	return (vp9.Payload[0] & 0x6) == 0
 }
 
-// IsAV1Keyframe detects if av1 payload is a keyframe
+// -------------------------------------
+
+// IsAV1KeyFrame detects if av1 payload is a keyframe
 // taken from https://github.com/jech/galene/blob/master/codecs/codecs.go
 // all credits belongs to Juliusz Chroboczek @jech and the awesome Galene SFU
-func IsAV1Keyframe(payload []byte) bool {
+func IsAV1KeyFrame(payload []byte) bool {
 	if len(payload) < 2 {
 		return false
 	}
@@ -378,37 +416,40 @@ func IsAV1Keyframe(payload []byte) bool {
 	}
 }
 
+func IsH265KeyFrame(payload []byte) (kf bool) {
+	if len(payload) < 2 {
+		return false
+	}
+	naluType := (payload[0] & 0x7E) >> 1
+	switch {
+	case naluType == 33 || naluType == 34:
+		return true
+	case naluType == 48: // AP
+		idx := 2
+		for idx < len(payload)-2 {
+			// TODO: check the DONL field (controled by sprop-max-don-diff)
+			size := binary.BigEndian.Uint16(payload[idx:])
+			idx += 2
+			if idx >= len(payload) {
+				return false
+			}
+			naluType = (payload[idx] & 0x7E) >> 1
+			if naluType == 33 || naluType == 34 {
+				return true
+			}
+			idx += int(size)
+		}
+		return false
+
+	case naluType == 49: // FU
+		if len(payload) < 3 {
+			return false
+		}
+		naluType = (payload[2] & 0x7E) >> 1
+		return naluType == 33 || naluType == 34
+	default:
+		return false
+	}
+}
+
 // -------------------------------------
-
-var (
-	ntpEpoch = time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
-)
-
-type NtpTime uint64
-
-func (t NtpTime) Duration() time.Duration {
-	sec := (t >> 32) * 1e9
-	frac := (t & 0xffffffff) * 1e9
-	nsec := frac >> 32
-	if uint32(frac) >= 0x80000000 {
-		nsec++
-	}
-	return time.Duration(sec + nsec)
-}
-
-func (t NtpTime) Time() time.Time {
-	return ntpEpoch.Add(t.Duration())
-}
-
-func ToNtpTime(t time.Time) NtpTime {
-	nsec := uint64(t.Sub(ntpEpoch))
-	sec := nsec / 1e9
-	nsec = (nsec - sec*1e9) << 32
-	frac := nsec / 1e9
-	if nsec%1e9 >= 1e9/2 {
-		frac++
-	}
-	return NtpTime(sec<<32 | frac)
-}
-
-// ------------------------------------------

@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package test
 
 import (
@@ -16,11 +30,12 @@ import (
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
-	"github.com/livekit/protocol/utils"
+	"github.com/livekit/protocol/utils/guid"
 	"github.com/livekit/protocol/webhook"
 
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
+	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/service"
 	"github.com/livekit/livekit-server/pkg/testutils"
 )
@@ -94,7 +109,7 @@ func TestWebhooks(t *testing.T) {
 
 	// room closed
 	rm := server.RoomManager().GetRoom(context.Background(), testRoom)
-	rm.Close()
+	rm.Close(types.ParticipantCloseReasonNone)
 	testutils.WithTimeout(t, func() string {
 		if ts.GetEvent(webhook.EventRoomFinished) == nil {
 			return "did not receive RoomFinished"
@@ -105,7 +120,7 @@ func TestWebhooks(t *testing.T) {
 }
 
 func setupServerWithWebhook() (server *service.LivekitServer, testServer *webhookTestServer, finishFunc func(), err error) {
-	conf, err := config.NewConfig("", nil)
+	conf, err := config.NewConfig("", true, nil, nil)
 	if err != nil {
 		panic(fmt.Sprintf("could not create config: %v", err))
 	}
@@ -122,7 +137,7 @@ func setupServerWithWebhook() (server *service.LivekitServer, testServer *webhoo
 	if err != nil {
 		return
 	}
-	currentNode.Id = utils.NewGuid(nodeID1)
+	currentNode.SetNodeID(livekit.NodeID(guid.New(nodeID1)))
 
 	server, err = service.InitializeServer(conf, currentNode)
 	if err != nil {

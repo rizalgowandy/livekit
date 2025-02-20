@@ -1,3 +1,17 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
@@ -14,13 +28,15 @@ import (
 
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/utils"
+	"github.com/livekit/protocol/utils/guid"
 
+	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/pkg/service"
 )
 
 func generateKeys(_ *cli.Context) error {
-	apiKey := utils.NewGuid(utils.APIKeyPrefix)
+	apiKey := guid.New(utils.APIKeyPrefix)
 	secret := utils.RandomSecret()
 	fmt.Println("API Key: ", apiKey)
 	fmt.Println("API Secret: ", secret)
@@ -40,8 +56,9 @@ func printPorts(c *cli.Context) error {
 	if conf.RTC.TCPPort != 0 {
 		tcpPorts = append(tcpPorts, fmt.Sprintf("%d - ICE/TCP", conf.RTC.TCPPort))
 	}
-	if conf.RTC.UDPPort != 0 {
-		udpPorts = append(udpPorts, fmt.Sprintf("%d - ICE/UDP", conf.RTC.UDPPort))
+	if conf.RTC.UDPPort.Valid() {
+		portStr, _ := conf.RTC.UDPPort.MarshalYAML()
+		udpPorts = append(udpPorts, fmt.Sprintf("%s - ICE/UDP", portStr))
 	} else {
 		udpPorts = append(udpPorts, fmt.Sprintf("%d-%d - ICE/UDP range", conf.RTC.ICEPortRangeStart, conf.RTC.ICEPortRangeEnd))
 	}
@@ -65,6 +82,16 @@ func printPorts(c *cli.Context) error {
 		fmt.Println(p)
 	}
 	return nil
+}
+
+func helpVerbose(c *cli.Context) error {
+	generatedFlags, err := config.GenerateCLIFlags(baseFlags, false)
+	if err != nil {
+		return err
+	}
+
+	c.App.Flags = append(baseFlags, generatedFlags...)
+	return cli.ShowAppHelp(c)
 }
 
 func createToken(c *cli.Context) error {
@@ -159,17 +186,19 @@ func listNodes(c *cli.Context) error {
 	table.SetAutoWrapText(false)
 	table.SetHeader([]string{
 		"ID", "IP Address", "Region",
-		"CPUs", "CPU Usage /\nLoad Avg",
-		"Rooms", "Clients /\nTracks In/Out",
-		"Bytes/s In/Out /\nBytes Total", "Packets/s In/Out /\nPackets Total",
-		"Nack/s /\nNack Total", "Retrans/s /\nRetrans Total",
-		"Started At /\nUpdated At",
+		"CPUs", "CPU Usage\nLoad Avg",
+		"Memory Used/Total",
+		"Rooms", "Clients\nTracks In/Out",
+		"Bytes/s In/Out\nBytes Total", "Packets/s In/Out\nPackets Total", "System Dropped Pkts/s\nPkts/s Out/Dropped",
+		"Nack/s\nNack Total", "Retrans/s\nRetrans Total",
+		"Started At\nUpdated At",
 	})
 	table.SetColumnAlignment([]int{
 		tablewriter.ALIGN_CENTER, tablewriter.ALIGN_CENTER, tablewriter.ALIGN_CENTER,
 		tablewriter.ALIGN_RIGHT, tablewriter.ALIGN_RIGHT,
+		tablewriter.ALIGN_RIGHT,
 		tablewriter.ALIGN_RIGHT, tablewriter.ALIGN_RIGHT,
-		tablewriter.ALIGN_RIGHT, tablewriter.ALIGN_RIGHT,
+		tablewriter.ALIGN_RIGHT, tablewriter.ALIGN_RIGHT, tablewriter.ALIGN_RIGHT,
 		tablewriter.ALIGN_RIGHT, tablewriter.ALIGN_RIGHT,
 		tablewriter.ALIGN_CENTER,
 	})
@@ -184,6 +213,7 @@ func listNodes(c *cli.Context) error {
 		cpus := strconv.Itoa(int(stats.NumCpus))
 		cpuUsageAndLoadAvg := fmt.Sprintf("%.2f %%\n%.2f %.2f %.2f", stats.CpuLoad*100,
 			stats.LoadAvgLast1Min, stats.LoadAvgLast5Min, stats.LoadAvgLast15Min)
+		memUsage := fmt.Sprintf("%s / %s", humanize.Bytes(stats.MemoryUsed), humanize.Bytes(stats.MemoryTotal))
 
 		// Room stats
 		rooms := strconv.Itoa(int(stats.NumRooms))
@@ -194,6 +224,7 @@ func listNodes(c *cli.Context) error {
 			humanize.Bytes(stats.BytesIn), humanize.Bytes(stats.BytesOut))
 		packets := fmt.Sprintf("%s / %s\n%s / %s", humanize.Comma(int64(stats.PacketsInPerSec)), humanize.Comma(int64(stats.PacketsOutPerSec)),
 			strings.TrimSpace(humanize.SIWithDigits(float64(stats.PacketsIn), 2, "")), strings.TrimSpace(humanize.SIWithDigits(float64(stats.PacketsOut), 2, "")))
+		sysPackets := fmt.Sprintf("%.2f %%\n%v / %v", stats.SysPacketsDroppedPctPerSec*100, float64(stats.SysPacketsOutPerSec), float64(stats.SysPacketsDroppedPerSec))
 		nacks := fmt.Sprintf("%.2f\n%s", stats.NackPerSec, strings.TrimSpace(humanize.SIWithDigits(float64(stats.NackTotal), 2, "")))
 		retransmit := fmt.Sprintf("%.2f\n%s", stats.RetransmitPacketsOutPerSec, strings.TrimSpace(humanize.SIWithDigits(float64(stats.RetransmitPacketsOut), 2, "")))
 
@@ -204,8 +235,9 @@ func listNodes(c *cli.Context) error {
 		table.Append([]string{
 			idAndState, node.Ip, node.Region,
 			cpus, cpuUsageAndLoadAvg,
+			memUsage,
 			rooms, clientsAndTracks,
-			bytes, packets,
+			bytes, packets, sysPackets,
 			nacks, retransmit,
 			startedAndUpdated,
 		})

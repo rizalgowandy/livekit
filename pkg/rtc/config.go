@@ -1,41 +1,46 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rtc
 
 import (
-	"errors"
-	"fmt"
-	"net"
-
-	"github.com/pion/ice/v2"
 	"github.com/pion/sdp/v3"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 
 	"github.com/livekit/livekit-server/pkg/config"
-	logging "github.com/livekit/livekit-server/pkg/logger"
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
-	dd "github.com/livekit/livekit-server/pkg/sfu/dependencydescriptor"
-	"github.com/livekit/protocol/logger"
+	dd "github.com/livekit/livekit-server/pkg/sfu/rtpextension/dependencydescriptor"
+	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
 )
 
 const (
-	minUDPBufferSize     = 5_000_000
-	defaultUDPBufferSize = 16_777_216
-	frameMarking         = "urn:ietf:params:rtp-hdrext:framemarking"
+	frameMarking        = "urn:ietf:params:rtp-hdrext:framemarking"
+	repairedRTPStreamID = "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id"
 )
 
 type WebRTCConfig struct {
-	Configuration  webrtc.Configuration
-	SettingEngine  webrtc.SettingEngine
-	Receiver       ReceiverConfig
-	BufferFactory  *buffer.Factory
-	UDPMux         ice.UDPMux
-	UDPMuxConn     *net.UDPConn
-	TCPMuxListener *net.TCPListener
-	Publisher      DirectionConfig
-	Subscriber     DirectionConfig
+	rtcconfig.WebRTCConfig
+
+	BufferFactory *buffer.Factory
+	Receiver      ReceiverConfig
+	Publisher     DirectionConfig
+	Subscriber    DirectionConfig
 }
 
 type ReceiverConfig struct {
-	PacketBufferSize int
+	PacketBufferSizeVideo int
+	PacketBufferSizeAudio int
 }
 
 type RTPHeaderExtensionConfig struct {
@@ -53,86 +58,26 @@ type DirectionConfig struct {
 	RTCPFeedback       RTCPFeedbackConfig
 }
 
-// number of packets to buffer up
-const readBufferSize = 50
-
-func NewWebRTCConfig(conf *config.Config, externalIP string) (*WebRTCConfig, error) {
+func NewWebRTCConfig(conf *config.Config) (*WebRTCConfig, error) {
 	rtcConf := conf.RTC
-	c := webrtc.Configuration{
-		SDPSemantics: webrtc.SDPSemanticsUnifiedPlan,
-	}
-	s := webrtc.SettingEngine{
-		LoggerFactory: logging.NewLoggerFactory(logger.GetLogger()),
+
+	webRTCConfig, err := rtcconfig.NewWebRTCConfig(&rtcConf.RTCConfig, conf.Development)
+	if err != nil {
+		return nil, err
 	}
 
-	// force it to the node IPs that the user has set
-	if externalIP != "" && (conf.RTC.UseExternalIP || conf.RTC.NodeIP != "") {
-		s.SetNAT1To1IPs([]string{externalIP}, webrtc.ICECandidateTypeHost)
-	}
+	// we don't want to use active TCP on a server, clients should be dialing
+	webRTCConfig.SettingEngine.DisableActiveTCP(true)
 
 	if rtcConf.PacketBufferSize == 0 {
 		rtcConf.PacketBufferSize = 500
 	}
-
-	var udpMux *ice.UDPMuxDefault
-	var udpMuxConn *net.UDPConn
-	var err error
-	networkTypes := make([]webrtc.NetworkType, 0, 4)
-
-	if !rtcConf.ForceTCP {
-		networkTypes = append(networkTypes,
-			webrtc.NetworkTypeUDP4, webrtc.NetworkTypeUDP6,
-		)
-		if rtcConf.ICEPortRangeStart != 0 && rtcConf.ICEPortRangeEnd != 0 {
-			if err := s.SetEphemeralUDPPortRange(uint16(rtcConf.ICEPortRangeStart), uint16(rtcConf.ICEPortRangeEnd)); err != nil {
-				return nil, err
-			}
-		} else if rtcConf.UDPPort != 0 {
-			udpMuxConn, err = net.ListenUDP("udp", &net.UDPAddr{
-				Port: int(rtcConf.UDPPort),
-			})
-			if err != nil {
-				return nil, err
-			}
-			_ = udpMuxConn.SetReadBuffer(defaultUDPBufferSize)
-			_ = udpMuxConn.SetWriteBuffer(defaultUDPBufferSize)
-
-			udpMux = ice.NewUDPMuxDefault(ice.UDPMuxParams{
-				Logger:  s.LoggerFactory.NewLogger("udp_mux"),
-				UDPConn: udpMuxConn,
-			})
-			s.SetICEUDPMux(udpMux)
-			if !conf.Development {
-				checkUDPReadBuffer()
-			}
-		}
+	if rtcConf.PacketBufferSizeVideo == 0 {
+		rtcConf.PacketBufferSizeVideo = rtcConf.PacketBufferSize
 	}
-
-	// use TCP mux when it's set
-	var tcpListener *net.TCPListener
-	if rtcConf.TCPPort != 0 {
-		networkTypes = append(networkTypes,
-			webrtc.NetworkTypeTCP4, webrtc.NetworkTypeTCP6,
-		)
-		tcpListener, err = net.ListenTCP("tcp", &net.TCPAddr{
-			Port: int(rtcConf.TCPPort),
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		tcpMux := webrtc.NewICETCPMux(
-			s.LoggerFactory.NewLogger("tcp_mux"),
-			tcpListener,
-			readBufferSize,
-		)
-		s.SetICETCPMux(tcpMux)
+	if rtcConf.PacketBufferSizeAudio == 0 {
+		rtcConf.PacketBufferSizeAudio = rtcConf.PacketBufferSize
 	}
-
-	if len(networkTypes) == 0 {
-		return nil, errors.New("TCP is forced but not configured")
-	}
-	s.SetNetworkTypes(networkTypes)
 
 	// publisher configuration
 	publisherConfig := DirectionConfig{
@@ -141,16 +86,22 @@ func NewWebRTCConfig(conf *config.Config, externalIP string) (*WebRTCConfig, err
 				sdp.SDESMidURI,
 				sdp.SDESRTPStreamIDURI,
 				sdp.AudioLevelURI,
+				//act.AbsCaptureTimeURI,
 			},
 			Video: []string{
 				sdp.SDESMidURI,
 				sdp.SDESRTPStreamIDURI,
 				sdp.TransportCCURI,
 				frameMarking,
-				dd.ExtensionUrl,
+				dd.ExtensionURI,
+				repairedRTPStreamID,
+				//act.AbsCaptureTimeURI,
 			},
 		},
 		RTCPFeedback: RTCPFeedbackConfig{
+			Audio: []webrtc.RTCPFeedback{
+				{Type: webrtc.TypeRTCPFBNACK},
+			},
 			Video: []webrtc.RTCPFeedback{
 				{Type: webrtc.TypeRTCPFBTransportCC},
 				{Type: webrtc.TypeRTCPFBCCM, Parameter: "fir"},
@@ -160,78 +111,19 @@ func NewWebRTCConfig(conf *config.Config, externalIP string) (*WebRTCConfig, err
 		},
 	}
 
-	// subscriber configuration
-	subscriberConfig := DirectionConfig{
-		RTPHeaderExtension: RTPHeaderExtensionConfig{
-			Video: []string{dd.ExtensionUrl},
-		},
-		RTCPFeedback: RTCPFeedbackConfig{
-			Video: []webrtc.RTCPFeedback{
-				{Type: webrtc.TypeRTCPFBCCM, Parameter: "fir"},
-				{Type: webrtc.TypeRTCPFBNACK},
-				{Type: webrtc.TypeRTCPFBNACK, Parameter: "pli"},
-			},
-		},
-	}
-	if rtcConf.CongestionControl.UseSendSideBWE {
-		subscriberConfig.RTPHeaderExtension.Video = append(subscriberConfig.RTPHeaderExtension.Video, sdp.TransportCCURI)
-		subscriberConfig.RTCPFeedback.Video = append(subscriberConfig.RTCPFeedback.Video, webrtc.RTCPFeedback{Type: webrtc.TypeRTCPFBTransportCC})
-	} else {
-		subscriberConfig.RTPHeaderExtension.Video = append(subscriberConfig.RTPHeaderExtension.Video, sdp.ABSSendTimeURI)
-		subscriberConfig.RTCPFeedback.Video = append(subscriberConfig.RTCPFeedback.Video, webrtc.RTCPFeedback{Type: webrtc.TypeRTCPFBGoogREMB})
-	}
-
-	if rtcConf.UseICELite {
-		s.SetLite(true)
-	} else if !rtcConf.UseExternalIP {
-		// use STUN servers for server to support NAT
-		// when deployed in production, we expect UseExternalIP to be used, and ports accessible
-		// this is not compatible with ICE Lite
-		if len(rtcConf.STUNServers) > 0 {
-			c.ICEServers = []webrtc.ICEServer{iceServerForStunServers(rtcConf.STUNServers)}
-		} else {
-			c.ICEServers = []webrtc.ICEServer{iceServerForStunServers(config.DefaultStunServers)}
-		}
-	}
-
-	if len(rtcConf.Interfaces.Includes) != 0 || len(rtcConf.Interfaces.Excludes) != 0 {
-		includes := rtcConf.Interfaces.Includes
-		excludes := rtcConf.Interfaces.Excludes
-		s.SetInterfaceFilter(func(s string) bool {
-			// filter by include interfaces
-			if len(includes) > 0 {
-				for _, iface := range includes {
-					if iface == s {
-						return true
-					}
-				}
-				return false
-			}
-
-			// filter by exclude interfaces
-			if len(excludes) > 0 {
-				for _, iface := range excludes {
-					if iface == s {
-						return false
-					}
-				}
-			}
-			return true
-		})
-	}
-
 	return &WebRTCConfig{
-		Configuration: c,
-		SettingEngine: s,
+		WebRTCConfig: *webRTCConfig,
 		Receiver: ReceiverConfig{
-			PacketBufferSize: rtcConf.PacketBufferSize,
+			PacketBufferSizeVideo: rtcConf.PacketBufferSizeVideo,
+			PacketBufferSizeAudio: rtcConf.PacketBufferSizeAudio,
 		},
-		UDPMux:         udpMux,
-		UDPMuxConn:     udpMuxConn,
-		TCPMuxListener: tcpListener,
-		Publisher:      publisherConfig,
-		Subscriber:     subscriberConfig,
+		Publisher:  publisherConfig,
+		Subscriber: getSubscriberConfig(rtcConf.CongestionControl.UseSendSideBWEInterceptor || rtcConf.CongestionControl.UseSendSideBWE),
 	}, nil
+}
+
+func (c *WebRTCConfig) UpdateCongestionControl(ccConf config.CongestionControlConfig) {
+	c.Subscriber = getSubscriberConfig(ccConf.UseSendSideBWEInterceptor || ccConf.UseSendSideBWE)
 }
 
 func (c *WebRTCConfig) SetBufferFactory(factory *buffer.Factory) {
@@ -239,10 +131,36 @@ func (c *WebRTCConfig) SetBufferFactory(factory *buffer.Factory) {
 	c.SettingEngine.BufferFactory = factory.GetOrNew
 }
 
-func iceServerForStunServers(servers []string) webrtc.ICEServer {
-	iceServer := webrtc.ICEServer{}
-	for _, stunServer := range servers {
-		iceServer.URLs = append(iceServer.URLs, fmt.Sprintf("stun:%s", stunServer))
+func getSubscriberConfig(enableTWCC bool) DirectionConfig {
+	subscriberConfig := DirectionConfig{
+		RTPHeaderExtension: RTPHeaderExtensionConfig{
+			Video: []string{
+				dd.ExtensionURI,
+				//act.AbsCaptureTimeURI,
+			},
+			Audio: []string{
+				//act.AbsCaptureTimeURI,
+			},
+		},
+		RTCPFeedback: RTCPFeedbackConfig{
+			Audio: []webrtc.RTCPFeedback{
+				// always enable NACK for audio but disable it later for red enabled transceiver. https://github.com/pion/webrtc/pull/2972
+				{Type: webrtc.TypeRTCPFBNACK},
+			},
+			Video: []webrtc.RTCPFeedback{
+				{Type: webrtc.TypeRTCPFBCCM, Parameter: "fir"},
+				{Type: webrtc.TypeRTCPFBNACK},
+				{Type: webrtc.TypeRTCPFBNACK, Parameter: "pli"},
+			},
+		},
 	}
-	return iceServer
+	if enableTWCC {
+		subscriberConfig.RTPHeaderExtension.Video = append(subscriberConfig.RTPHeaderExtension.Video, sdp.TransportCCURI)
+		subscriberConfig.RTCPFeedback.Video = append(subscriberConfig.RTCPFeedback.Video, webrtc.RTCPFeedback{Type: webrtc.TypeRTCPFBTransportCC})
+	} else {
+		subscriberConfig.RTPHeaderExtension.Video = append(subscriberConfig.RTPHeaderExtension.Video, sdp.ABSSendTimeURI)
+		subscriberConfig.RTCPFeedback.Video = append(subscriberConfig.RTCPFeedback.Video, webrtc.RTCPFeedback{Type: webrtc.TypeRTCPFBGoogREMB})
+	}
+
+	return subscriberConfig
 }

@@ -1,28 +1,41 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rtc
 
 import (
-	"context"
 	"errors"
 	"sync"
-	"time"
 
-	"github.com/bep/debounce"
 	"github.com/pion/rtcp"
-	"github.com/pion/webrtc/v3"
-	"github.com/pion/webrtc/v3/pkg/rtcerr"
+	"github.com/pion/webrtc/v4"
+	"go.uber.org/atomic"
 
+	"github.com/livekit/livekit-server/pkg/sfu/buffer"
+	"github.com/livekit/livekit-server/pkg/sfu/mime"
+	sutils "github.com/livekit/livekit-server/pkg/utils"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 
-	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/sfu"
-	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/livekit-server/pkg/telemetry"
 )
 
-const (
-	initialQualityUpdateWait = 10 * time.Second
+var (
+	errAlreadySubscribed = errors.New("already subscribed")
+	errNotFound          = errors.New("not found")
 )
 
 // MediaTrackSubscriptions manages subscriptions of a media track
@@ -31,27 +44,17 @@ type MediaTrackSubscriptions struct {
 
 	subscribedTracksMu sync.RWMutex
 	subscribedTracks   map[livekit.ParticipantID]types.SubscribedTrack
-	pendingClose       map[livekit.ParticipantID]types.SubscribedTrack
 
-	onNoSubscribers func()
-
-	// quality level enable/disable
-	maxQualityLock               sync.RWMutex
-	maxSubscriberQuality         map[livekit.ParticipantID]livekit.VideoQuality
-	maxSubscriberNodeQuality     map[livekit.NodeID]livekit.VideoQuality
-	maxSubscribedQuality         livekit.VideoQuality
-	maxSubscribedQualityDebounce func(func())
-	onSubscribedMaxQualityChange func(subscribedQualities []*livekit.SubscribedQuality, maxSubscribedQuality livekit.VideoQuality)
-	maxQualityTimer              *time.Timer
+	onDownTrackCreated           func(downTrack *sfu.DownTrack)
+	onSubscriberMaxQualityChange func(subscriberID livekit.ParticipantID, mime mime.MimeType, layer int32)
 }
 
 type MediaTrackSubscriptionsParams struct {
 	MediaTrack types.MediaTrack
+	IsRelayed  bool
 
-	BufferFactory    *buffer.Factory
 	ReceiverConfig   ReceiverConfig
 	SubscriberConfig DirectionConfig
-	VideoConfig      config.VideoConfig
 
 	Telemetry telemetry.TelemetryService
 
@@ -59,33 +62,18 @@ type MediaTrackSubscriptionsParams struct {
 }
 
 func NewMediaTrackSubscriptions(params MediaTrackSubscriptionsParams) *MediaTrackSubscriptions {
-	t := &MediaTrackSubscriptions{
-		params:                       params,
-		subscribedTracks:             make(map[livekit.ParticipantID]types.SubscribedTrack),
-		pendingClose:                 make(map[livekit.ParticipantID]types.SubscribedTrack),
-		maxSubscriberQuality:         make(map[livekit.ParticipantID]livekit.VideoQuality),
-		maxSubscriberNodeQuality:     make(map[livekit.NodeID]livekit.VideoQuality),
-		maxSubscribedQuality:         livekit.VideoQuality_HIGH,
-		maxSubscribedQualityDebounce: debounce.New(params.VideoConfig.DynacastPauseDelay),
+	return &MediaTrackSubscriptions{
+		params:           params,
+		subscribedTracks: make(map[livekit.ParticipantID]types.SubscribedTrack),
 	}
-
-	return t
 }
 
-func (t *MediaTrackSubscriptions) Start() {
-	t.startMaxQualityTimer(false)
+func (t *MediaTrackSubscriptions) OnDownTrackCreated(f func(downTrack *sfu.DownTrack)) {
+	t.onDownTrackCreated = f
 }
 
-func (t *MediaTrackSubscriptions) Restart() {
-	t.startMaxQualityTimer(true)
-}
-
-func (t *MediaTrackSubscriptions) Close() {
-	t.stopMaxQualityTimer()
-}
-
-func (t *MediaTrackSubscriptions) OnNoSubscribers(f func()) {
-	t.onNoSubscribers = f
+func (t *MediaTrackSubscriptions) OnSubscriberMaxQualityChange(f func(subscriberID livekit.ParticipantID, mime mime.MimeType, layer int32)) {
+	t.onSubscriberMaxQualityChange = f
 }
 
 func (t *MediaTrackSubscriptions) SetMuted(muted bool) {
@@ -104,7 +92,7 @@ func (t *MediaTrackSubscriptions) IsSubscriber(subID livekit.ParticipantID) bool
 }
 
 // AddSubscriber subscribes sub to current mediaTrack
-func (t *MediaTrackSubscriptions) AddSubscriber(sub types.LocalParticipant, codec webrtc.RTPCodecCapability, wr WrappedReceiver) (*sfu.DownTrack, error) {
+func (t *MediaTrackSubscriptions) AddSubscriber(sub types.LocalParticipant, wr *WrappedReceiver) (types.SubscribedTrack, error) {
 	trackID := t.params.MediaTrack.ID()
 	subscriberID := sub.ID()
 
@@ -112,191 +100,272 @@ func (t *MediaTrackSubscriptions) AddSubscriber(sub types.LocalParticipant, code
 	t.subscribedTracksMu.Lock()
 	if _, ok := t.subscribedTracks[subscriberID]; ok {
 		t.subscribedTracksMu.Unlock()
-		return nil, nil
+		return nil, errAlreadySubscribed
 	}
 	t.subscribedTracksMu.Unlock()
 
 	var rtcpFeedback []webrtc.RTCPFeedback
+	var maxTrack int
 	switch t.params.MediaTrack.Kind() {
 	case livekit.TrackType_AUDIO:
 		rtcpFeedback = t.params.SubscriberConfig.RTCPFeedback.Audio
+		maxTrack = t.params.ReceiverConfig.PacketBufferSizeAudio
 	case livekit.TrackType_VIDEO:
 		rtcpFeedback = t.params.SubscriberConfig.RTCPFeedback.Video
+		maxTrack = t.params.ReceiverConfig.PacketBufferSizeVideo
 	}
-	downTrack, err := sfu.NewDownTrack(
-		webrtc.RTPCodecCapability{
-			MimeType:     codec.MimeType,
-			ClockRate:    codec.ClockRate,
-			Channels:     codec.Channels,
-			SDPFmtpLine:  codec.SDPFmtpLine,
-			RTCPFeedback: rtcpFeedback,
-		},
-		wr,
-		t.params.BufferFactory,
-		subscriberID,
-		t.params.ReceiverConfig.PacketBufferSize,
-		LoggerWithTrack(sub.GetLogger(), trackID),
-	)
+	codecs := wr.Codecs()
+	for _, c := range codecs {
+		c.RTCPFeedback = rtcpFeedback
+	}
+
+	streamID := wr.StreamID()
+	if sub.SupportsSyncStreamID() && t.params.MediaTrack.Stream() != "" {
+		streamID = PackSyncStreamID(t.params.MediaTrack.PublisherID(), t.params.MediaTrack.Stream())
+	}
+
+	var trailer []byte
+	if t.params.MediaTrack.IsEncrypted() {
+		trailer = sub.GetTrailer()
+	}
+
+	downTrack, err := sfu.NewDownTrack(sfu.DowntrackParams{
+		Codecs:                         codecs,
+		Source:                         t.params.MediaTrack.Source(),
+		Receiver:                       wr,
+		BufferFactory:                  sub.GetBufferFactory(),
+		SubID:                          subscriberID,
+		StreamID:                       streamID,
+		MaxTrack:                       maxTrack,
+		PlayoutDelayLimit:              sub.GetPlayoutDelayConfig(),
+		Pacer:                          sub.GetPacer(),
+		Trailer:                        trailer,
+		Logger:                         LoggerWithTrack(sub.GetLogger().WithComponent(sutils.ComponentSub), trackID, t.params.IsRelayed),
+		RTCPWriter:                     sub.WriteSubscriberRTCP,
+		DisableSenderReportPassThrough: sub.GetDisableSenderReportPassThrough(),
+		SupportsCodecChange:            sub.SupportsCodecChange(),
+	})
 	if err != nil {
 		return nil, err
 	}
 
+	if t.onDownTrackCreated != nil {
+		t.onDownTrackCreated(downTrack)
+	}
+
 	subTrack := NewSubscribedTrack(SubscribedTrackParams{
-		PublisherID:        t.params.MediaTrack.PublisherID(),
-		PublisherIdentity:  t.params.MediaTrack.PublisherIdentity(),
-		SubscriberID:       subscriberID,
-		SubscriberIdentity: sub.Identity(),
-		MediaTrack:         t.params.MediaTrack,
-		DownTrack:          downTrack,
-		AdaptiveStream:     sub.GetAdaptiveStream(),
+		PublisherID:       t.params.MediaTrack.PublisherID(),
+		PublisherIdentity: t.params.MediaTrack.PublisherIdentity(),
+		PublisherVersion:  t.params.MediaTrack.PublisherVersion(),
+		Subscriber:        sub,
+		MediaTrack:        t.params.MediaTrack,
+		DownTrack:         downTrack,
+		AdaptiveStream:    sub.GetAdaptiveStream(),
+	})
+
+	if !sub.Hidden() {
+		subTrack.AddOnBind(func(err error) {
+			if err == nil {
+				t.params.MediaTrack.OnTrackSubscribed()
+			}
+		})
+	}
+
+	// Bind callback can happen from replaceTrack, so set it up early
+	var reusingTransceiver atomic.Bool
+	var dtState sfu.DownTrackState
+	downTrack.OnCodecNegotiated(func(codec webrtc.RTPCodecCapability) {
+		if !wr.DetermineReceiver(codec) {
+			if t.onSubscriberMaxQualityChange != nil {
+				go func() {
+					spatial := buffer.VideoQualityToSpatialLayer(livekit.VideoQuality_HIGH, t.params.MediaTrack.ToProto())
+					t.onSubscriberMaxQualityChange(downTrack.SubscriberID(), mime.NormalizeMimeType(codec.MimeType), spatial)
+				}()
+			}
+		}
+	})
+	downTrack.OnBinding(func(err error) {
+		if err != nil {
+			go subTrack.Bound(err)
+			return
+		}
+		if reusingTransceiver.Load() {
+			sub.GetLogger().Debugw("seeding downtrack state", "trackID", trackID)
+			downTrack.SeedState(dtState)
+		}
+		if err = wr.AddDownTrack(downTrack); err != nil && err != sfu.ErrReceiverClosed {
+			sub.GetLogger().Errorw(
+				"could not add down track", err,
+				"publisher", subTrack.PublisherIdentity(),
+				"publisherID", subTrack.PublisherID(),
+				"trackID", trackID,
+			)
+		}
+
+		go subTrack.Bound(nil)
+
+		subTrack.SetPublisherMuted(t.params.MediaTrack.IsMuted())
+	})
+
+	downTrack.OnStatsUpdate(func(_ *sfu.DownTrack, stat *livekit.AnalyticsStat) {
+		key := telemetry.StatsKeyForTrack(livekit.StreamType_DOWNSTREAM, subscriberID, trackID, t.params.MediaTrack.Source(), t.params.MediaTrack.Kind())
+		t.params.Telemetry.TrackStats(key, stat)
+	})
+
+	downTrack.OnMaxLayerChanged(func(dt *sfu.DownTrack, layer int32) {
+		if t.onSubscriberMaxQualityChange != nil {
+			t.onSubscriberMaxQualityChange(dt.SubscriberID(), dt.Mime(), layer)
+		}
+	})
+
+	downTrack.OnRttUpdate(func(_ *sfu.DownTrack, rtt uint32) {
+		go sub.UpdateMediaRTT(rtt)
+	})
+
+	downTrack.AddReceiverReportListener(func(dt *sfu.DownTrack, report *rtcp.ReceiverReport) {
+		sub.HandleReceiverReport(dt, report)
 	})
 
 	var transceiver *webrtc.RTPTransceiver
 	var sender *webrtc.RTPSender
-	if sub.ProtocolVersion().SupportsTransceiverReuse() {
-		//
-		// AddTrack will create a new transceiver or re-use an unused one
-		// if the attributes match. This prevents SDP from bloating
-		// because of dormant transceivers building up.
-		//
-		sender, err = sub.SubscriberPC().AddTrack(downTrack)
-		if err != nil {
-			return nil, err
-		}
 
-		// as there is no way to get transceiver from sender, search
-		for _, tr := range sub.SubscriberPC().GetTransceivers() {
-			if tr.Sender() == sender {
-				transceiver = tr
-				break
+	// try cached RTP senders for a chance to replace track
+	var existingTransceiver *webrtc.RTPTransceiver
+	replacedTrack := false
+	existingTransceiver, dtState = sub.GetCachedDownTrack(trackID)
+	if existingTransceiver != nil {
+		sub.GetLogger().Debugw(
+			"trying to use existing transceiver",
+			"publisher", subTrack.PublisherIdentity(),
+			"publisherID", subTrack.PublisherID(),
+			"trackID", trackID,
+		)
+		reusingTransceiver.Store(true)
+		rtpSender := existingTransceiver.Sender()
+		if rtpSender != nil {
+			// replaced track will bind immediately without negotiation, SetTransceiver first before bind
+			downTrack.SetTransceiver(existingTransceiver)
+			err := rtpSender.ReplaceTrack(downTrack)
+			if err == nil {
+				sender = rtpSender
+				transceiver = existingTransceiver
+				replacedTrack = true
+				sub.GetLogger().Debugw(
+					"track replaced",
+					"publisher", subTrack.PublisherIdentity(),
+					"publisherID", subTrack.PublisherID(),
+					"trackID", trackID,
+				)
 			}
 		}
-		if transceiver == nil {
-			// cannot add, no transceiver
-			return nil, errors.New("cannot subscribe without a transceiver in place")
-		}
-	} else {
-		transceiver, err = sub.SubscriberPC().AddTransceiverFromTrack(downTrack, webrtc.RTPTransceiverInit{
-			Direction: webrtc.RTPTransceiverDirectionSendonly,
-		})
-		if err != nil {
-			return nil, err
-		}
 
-		sender = transceiver.Sender()
-		if sender == nil {
-			// cannot add, no sender
-			return nil, errors.New("cannot subscribe without a sender in place")
+		if !replacedTrack {
+			// Could not re-use cached transceiver for this track.
+			// Stop the transceiver so that it is at least not active.
+			// It is not usable once stopped,
+			//
+			// Adding down track will create a new transceiver (or re-use
+			// an inactive existing one). In either case, a renegotiation
+			// will happen and that will notify remote of this stopped
+			// transceiver
+			existingTransceiver.Stop()
+			reusingTransceiver.Store(false)
 		}
 	}
 
-	sendParameters := sender.GetParameters()
-	downTrack.SetRTPHeaderExtensions(sendParameters.HeaderExtensions)
+	// if cannot replace, find an unused transceiver or add new one
+	if transceiver == nil {
+		info := t.params.MediaTrack.ToProto()
+		addTrackParams := types.AddTrackParams{
+			Stereo: info.Stereo,
+			Red:    !info.DisableRed,
+		}
+		if addTrackParams.Red && (len(codecs) == 1 && mime.IsMimeTypeStringOpus(codecs[0].MimeType)) {
+			addTrackParams.Red = false
+		}
+
+		sub.VerifySubscribeParticipantInfo(subTrack.PublisherID(), subTrack.PublisherVersion())
+		if sub.SupportsTransceiverReuse() {
+			//
+			// AddTrack will create a new transceiver or re-use an unused one
+			// if the attributes match. This prevents SDP from bloating
+			// because of dormant transceivers building up.
+			//
+			sender, transceiver, err = sub.AddTrackLocal(downTrack, addTrackParams)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			sender, transceiver, err = sub.AddTransceiverFromTrackLocal(downTrack, addTrackParams)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// whether re-using or stopping remove transceiver from cache
+	// NOTE: safety net, if somehow a cached transceiver is re-used by a different track
+	sub.UncacheDownTrack(transceiver)
+
+	// negotiation isn't required if we've replaced track
+	// ONE-SHOT-SIGNALLING-MODE: this should not be needed, but that mode information is not available here,
+	//   but it is not detrimental to set this, needs clean up when participants modes are separated out better.
+	subTrack.SetNeedsNegotiation(!replacedTrack)
+	subTrack.SetRTPSender(sender)
+
+	// it is possible that subscribed track is closed before subscription manager sets
+	// the `OnClose` callback. That handler in subscription manager removes the track
+	// from the peer connection.
+	//
+	// But, the subscription could be removed early if the published track is closed
+	// while adding subscription. In those cases, subscription manager would not have set
+	// the `OnClose` callback. So, set it here to handle cases of early close.
+	subTrack.OnClose(func(isExpectedToResume bool) {
+		if !isExpectedToResume {
+			if err := sub.RemoveTrackLocal(sender); err != nil {
+				t.params.Logger.Warnw("could not remove track from peer connection", err)
+			}
+		}
+	})
 
 	downTrack.SetTransceiver(transceiver)
 
-	// when out track is bound, start loop to send reports
-	downTrack.OnBind(func() {
-		go subTrack.Bound()
-		go t.sendDownTrackBindingReports(sub)
-	})
-
-	downTrack.OnStatsUpdate(func(_ *sfu.DownTrack, stat *livekit.AnalyticsStat) {
-		t.params.Telemetry.TrackStats(livekit.StreamType_DOWNSTREAM, subscriberID, trackID, stat)
-	})
-
-	downTrack.OnMaxLayerChanged(func(dt *sfu.DownTrack, layer int32) {
-		go t.notifySubscriberMaxQuality(subscriberID, QualityForSpatialLayer(layer))
-	})
-
-	downTrack.OnRttUpdate(func(_ *sfu.DownTrack, rtt uint32) {
-		go sub.UpdateRTT(rtt)
-	})
-
-	downTrack.OnCloseHandler(func() {
-		go t.downTrackClosed(sub, subTrack, sender)
+	downTrack.OnCloseHandler(func(isExpectedToResume bool) {
+		t.downTrackClosed(sub, subTrack, isExpectedToResume)
 	})
 
 	t.subscribedTracksMu.Lock()
 	t.subscribedTracks[subscriberID] = subTrack
 	t.subscribedTracksMu.Unlock()
-	subTrack.SetPublisherMuted(t.params.MediaTrack.IsMuted())
 
-	// since sub will lock, run it in a goroutine to avoid deadlocks
-	go func() {
-		sub.AddSubscribedTrack(subTrack)
-		sub.Negotiate()
-	}()
-
-	// initialize to default layer
-	t.notifySubscriberMaxQuality(subscriberID, livekit.VideoQuality_HIGH)
-	t.params.Telemetry.TrackSubscribed(context.Background(), subscriberID, t.params.MediaTrack.ToProto(),
-		&livekit.ParticipantInfo{Sid: string(t.params.MediaTrack.PublisherID()), Identity: string(t.params.MediaTrack.PublisherIdentity())})
-	return downTrack, nil
+	return subTrack, nil
 }
 
 // RemoveSubscriber removes participant from subscription
 // stop all forwarders to the client
-func (t *MediaTrackSubscriptions) RemoveSubscriber(participantID livekit.ParticipantID, resume bool) {
-	subTrack := t.getSubscribedTrack(participantID)
-
-	t.subscribedTracksMu.Lock()
-	delete(t.subscribedTracks, participantID)
-	if subTrack != nil {
-		t.pendingClose[participantID] = subTrack
+func (t *MediaTrackSubscriptions) RemoveSubscriber(subscriberID livekit.ParticipantID, isExpectedToResume bool) error {
+	subTrack := t.getSubscribedTrack(subscriberID)
+	if subTrack == nil {
+		return errNotFound
 	}
-	t.subscribedTracksMu.Unlock()
 
-	if subTrack != nil {
-		subTrack.DownTrack().CloseWithFlush(!resume)
-	}
+	t.params.Logger.Debugw("removing subscriber", "subscriberID", subscriberID, "isExpectedToResume", isExpectedToResume)
+	t.closeSubscribedTrack(subTrack, isExpectedToResume)
+	return nil
 }
 
-func (t *MediaTrackSubscriptions) RemoveAllSubscribers() {
-	t.params.Logger.Debugw("removing all subscribers")
-
-	t.subscribedTracksMu.Lock()
-	subscribedTracks := t.getAllSubscribedTracksLocked()
-	t.subscribedTracks = make(map[livekit.ParticipantID]types.SubscribedTrack)
-
-	for _, subTrack := range subscribedTracks {
-		t.pendingClose[subTrack.SubscriberID()] = subTrack
-	}
-	t.subscribedTracksMu.Unlock()
-
-	for _, subTrack := range subscribedTracks {
-		subTrack.DownTrack().Close()
-	}
-}
-
-func (t *MediaTrackSubscriptions) ResyncAllSubscribers() {
-	t.params.Logger.Debugw("resyncing all subscribers")
-
-	for _, subTrack := range t.getAllSubscribedTracks() {
-		subTrack.DownTrack().Resync()
-	}
-}
-
-func (t *MediaTrackSubscriptions) RevokeDisallowedSubscribers(allowedSubscriberIdentities []livekit.ParticipantIdentity) []livekit.ParticipantIdentity {
-	var revokedSubscriberIdentities []livekit.ParticipantIdentity
-
-	// LK-TODO: large number of subscribers needs to be solved for this loop
-	for _, subTrack := range t.getAllSubscribedTracks() {
-		found := false
-		for _, allowedIdentity := range allowedSubscriberIdentities {
-			if subTrack.SubscriberIdentity() == allowedIdentity {
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			go subTrack.DownTrack().Close()
-			revokedSubscriberIdentities = append(revokedSubscriberIdentities, subTrack.SubscriberIdentity())
-		}
+func (t *MediaTrackSubscriptions) closeSubscribedTrack(subTrack types.SubscribedTrack, isExpectedToResume bool) {
+	dt := subTrack.DownTrack()
+	if dt == nil {
+		return
 	}
 
-	return revokedSubscriberIdentities
+	if isExpectedToResume {
+		dt.CloseWithFlush(false)
+	} else {
+		// flushing blocks, avoid blocking when publisher removes all its subscribers
+		go dt.CloseWithFlush(true)
+	}
 }
 
 func (t *MediaTrackSubscriptions) GetAllSubscribers() []livekit.ParticipantID {
@@ -308,6 +377,28 @@ func (t *MediaTrackSubscriptions) GetAllSubscribers() []livekit.ParticipantID {
 		subs = append(subs, id)
 	}
 	return subs
+}
+
+func (t *MediaTrackSubscriptions) GetAllSubscribersForMime(mime mime.MimeType) []livekit.ParticipantID {
+	t.subscribedTracksMu.RLock()
+	defer t.subscribedTracksMu.RUnlock()
+
+	subs := make([]livekit.ParticipantID, 0, len(t.subscribedTracks))
+	for id, subTrack := range t.subscribedTracks {
+		if subTrack.DownTrack().Mime() != mime {
+			continue
+		}
+
+		subs = append(subs, id)
+	}
+	return subs
+}
+
+func (t *MediaTrackSubscriptions) GetNumSubscribers() int {
+	t.subscribedTracksMu.RLock()
+	defer t.subscribedTracksMu.RUnlock()
+
+	return len(t.subscribedTracks)
 }
 
 func (t *MediaTrackSubscriptions) UpdateVideoLayers() {
@@ -338,263 +429,37 @@ func (t *MediaTrackSubscriptions) getAllSubscribedTracksLocked() []types.Subscri
 	return subTracks
 }
 
-// TODO: send for all down tracks from the source participant
-// https://tools.ietf.org/html/rfc7941
-func (t *MediaTrackSubscriptions) sendDownTrackBindingReports(sub types.LocalParticipant) {
-	var sd []rtcp.SourceDescriptionChunk
-
-	subTrack := t.getSubscribedTrack(sub.ID())
-	if subTrack == nil {
-		return
-	}
-
-	chunks := subTrack.DownTrack().CreateSourceDescriptionChunks()
-	if chunks == nil {
-		return
-	}
-	sd = append(sd, chunks...)
-
-	pkts := []rtcp.Packet{
-		&rtcp.SourceDescription{Chunks: sd},
-	}
-
-	go func() {
-		defer RecoverSilent()
-		batch := pkts
-		i := 0
-		for {
-			if err := sub.SubscriberPC().WriteRTCP(batch); err != nil {
-				t.params.Logger.Errorw("could not write RTCP", err)
-				return
-			}
-			if i > 5 {
-				return
-			}
-			i++
-			time.Sleep(20 * time.Millisecond)
-		}
-	}()
-}
-
 func (t *MediaTrackSubscriptions) DebugInfo() []map[string]interface{} {
 	subscribedTrackInfo := make([]map[string]interface{}, 0)
 	for _, val := range t.getAllSubscribedTracks() {
 		if st, ok := val.(*SubscribedTrack); ok {
-			dt := st.DownTrack().DebugInfo()
-			dt["PubMuted"] = st.pubMuted.Load()
-			dt["SubMuted"] = st.subMuted.Load()
-			subscribedTrackInfo = append(subscribedTrackInfo, dt)
+			subscribedTrackInfo = append(subscribedTrackInfo, st.DownTrack().DebugInfo())
 		}
 	}
 
 	return subscribedTrackInfo
 }
 
-func (t *MediaTrackSubscriptions) OnSubscribedMaxQualityChange(f func(subscribedQualities []*livekit.SubscribedQuality, maxSubscribedQuality livekit.VideoQuality)) {
-	t.onSubscribedMaxQualityChange = f
-}
-
-func (t *MediaTrackSubscriptions) notifySubscriberMaxQuality(subscriberID livekit.ParticipantID, quality livekit.VideoQuality) {
-	if t.params.MediaTrack.Kind() != livekit.TrackType_VIDEO {
-		return
-	}
-
-	t.maxQualityLock.Lock()
-	if quality == livekit.VideoQuality_OFF {
-		_, ok := t.maxSubscriberQuality[subscriberID]
-		if !ok {
-			t.maxQualityLock.Unlock()
-			return
-		}
-
-		delete(t.maxSubscriberQuality, subscriberID)
-	} else {
-		maxQuality, ok := t.maxSubscriberQuality[subscriberID]
-		if ok && maxQuality == quality {
-			t.maxQualityLock.Unlock()
-			return
-		}
-
-		t.maxSubscriberQuality[subscriberID] = quality
-	}
-	t.maxQualityLock.Unlock()
-
-	t.UpdateQualityChange(false)
-}
-
-func (t *MediaTrackSubscriptions) NotifySubscriberNodeMaxQuality(nodeID livekit.NodeID, quality livekit.VideoQuality) {
-	if t.params.MediaTrack.Kind() != livekit.TrackType_VIDEO {
-		return
-	}
-
-	t.maxQualityLock.Lock()
-	if quality == livekit.VideoQuality_OFF {
-		_, ok := t.maxSubscriberNodeQuality[nodeID]
-		if !ok {
-			t.maxQualityLock.Unlock()
-			return
-		}
-
-		delete(t.maxSubscriberNodeQuality, nodeID)
-	} else {
-		maxQuality, ok := t.maxSubscriberNodeQuality[nodeID]
-		if ok && maxQuality == quality {
-			t.maxQualityLock.Unlock()
-			return
-		}
-
-		t.maxSubscriberNodeQuality[nodeID] = quality
-	}
-	t.maxQualityLock.Unlock()
-
-	t.UpdateQualityChange(false)
-}
-
-func (t *MediaTrackSubscriptions) UpdateQualityChange(force bool) {
-	if t.params.MediaTrack.Kind() != livekit.TrackType_VIDEO {
-		return
-	}
-
-	t.maxQualityLock.Lock()
-	maxSubscribedQuality := livekit.VideoQuality_OFF
-	for _, subQuality := range t.maxSubscriberQuality {
-		if maxSubscribedQuality == livekit.VideoQuality_OFF || subQuality > maxSubscribedQuality {
-			maxSubscribedQuality = subQuality
-		}
-	}
-
-	for _, subQuality := range t.maxSubscriberNodeQuality {
-		if maxSubscribedQuality == livekit.VideoQuality_OFF || subQuality > maxSubscribedQuality {
-			maxSubscribedQuality = subQuality
-		}
-	}
-
-	if maxSubscribedQuality == t.maxSubscribedQuality && !force {
-		t.maxQualityLock.Unlock()
-		return
-	}
-
-	// if quality comes down(or become OFF), delay notify to publisher
-	if (t.maxSubscribedQuality != livekit.VideoQuality_OFF) &&
-		(t.maxSubscribedQuality > maxSubscribedQuality || maxSubscribedQuality == livekit.VideoQuality_OFF) &&
-		t.params.VideoConfig.DynacastPauseDelay > 0 && !force {
-
-		t.params.Logger.Debugw("throttle quality change", "from", t.maxSubscribedQuality, "to", maxSubscribedQuality)
-		t.maxQualityLock.Unlock()
-		t.maxSubscribedQualityDebounce(func() {
-			t.UpdateQualityChange(true)
-		})
-		return
-	}
-
-	t.maxSubscribedQuality = maxSubscribedQuality
-
-	var subscribedQualities []*livekit.SubscribedQuality
-	if t.maxSubscribedQuality == livekit.VideoQuality_OFF {
-		subscribedQualities = []*livekit.SubscribedQuality{
-			{Quality: livekit.VideoQuality_LOW, Enabled: false},
-			{Quality: livekit.VideoQuality_MEDIUM, Enabled: false},
-			{Quality: livekit.VideoQuality_HIGH, Enabled: false},
-		}
-	} else {
-		for q := livekit.VideoQuality_LOW; q <= livekit.VideoQuality_HIGH; q++ {
-			subscribedQualities = append(subscribedQualities, &livekit.SubscribedQuality{
-				Quality: q,
-				Enabled: q <= t.maxSubscribedQuality,
-			})
-		}
-	}
-	t.maxQualityLock.Unlock()
-
-	if t.onSubscribedMaxQualityChange != nil {
-		t.onSubscribedMaxQualityChange(subscribedQualities, maxSubscribedQuality)
-	}
-}
-
-func (t *MediaTrackSubscriptions) startMaxQualityTimer(force bool) {
-	t.maxQualityLock.Lock()
-	defer t.maxQualityLock.Unlock()
-
-	if t.params.MediaTrack.Kind() != livekit.TrackType_VIDEO {
-		return
-	}
-
-	t.maxQualityTimer = time.AfterFunc(initialQualityUpdateWait, func() {
-		t.stopMaxQualityTimer()
-		t.UpdateQualityChange(force)
-	})
-}
-
-func (t *MediaTrackSubscriptions) stopMaxQualityTimer() {
-	t.maxQualityLock.Lock()
-	defer t.maxQualityLock.Unlock()
-
-	if t.maxQualityTimer != nil {
-		t.maxQualityTimer.Stop()
-		t.maxQualityTimer = nil
-	}
-}
-
-func (t *MediaTrackSubscriptions) maybeNotifyNoSubscribers() {
-	if t.onNoSubscribers == nil {
-		return
-	}
-
-	t.subscribedTracksMu.RLock()
-	empty := len(t.subscribedTracks) == 0 && len(t.pendingClose) == 0
-	t.subscribedTracksMu.RUnlock()
-
-	if empty {
-		t.onNoSubscribers()
-	}
-}
-
 func (t *MediaTrackSubscriptions) downTrackClosed(
 	sub types.LocalParticipant,
 	subTrack types.SubscribedTrack,
-	sender *webrtc.RTPSender,
+	isExpectedToResume bool,
 ) {
-	subscriberID := sub.ID()
-	t.subscribedTracksMu.Lock()
-	delete(t.subscribedTracks, subscriberID)
-	delete(t.pendingClose, subscriberID)
-	t.subscribedTracksMu.Unlock()
-
-	t.maybeNotifyNoSubscribers()
-
-	t.params.Telemetry.TrackUnsubscribed(context.Background(), subscriberID, t.params.MediaTrack.ToProto())
-
-	// ignore if the subscribing sub is not connected
-	if sub.SubscriberPC().ConnectionState() == webrtc.PeerConnectionStateClosed {
-		return
-	}
-
-	// if the source has been terminated, we'll need to terminate all the subscribed tracks
-	// however, if the dest sub has disconnected, then we can skip
-	if sender == nil {
-		return
-	}
-	t.params.Logger.Debugw("removing peerconnection track",
-		"subscriber", sub.Identity(),
-		"subscriberID", subscriberID,
-		"kind", t.params.MediaTrack.Kind(),
-	)
-	if err := sub.SubscriberPC().RemoveTrack(sender); err != nil {
-		if err == webrtc.ErrConnectionClosed {
-			// sub closing, can skip removing subscribedtracks
-			return
-		}
-		if _, ok := err.(*rtcerr.InvalidStateError); !ok {
-			// most of these are safe to ignore, since the track state might have already
-			// been set to Inactive
-			t.params.Logger.Debugw("could not remove remoteTrack from forwarder",
-				"error", err,
-				"subscriber", sub.Identity(),
-				"subscriberID", subscriberID,
-			)
+	// Cache transceiver for potential re-use on resume.
+	// To ensure subscription manager does not re-subscribe before caching,
+	// delete the subscribed track only after caching.
+	if isExpectedToResume {
+		dt := subTrack.DownTrack()
+		tr := dt.GetTransceiver()
+		if tr != nil {
+			sub.CacheDownTrack(subTrack.ID(), tr, dt.GetState())
 		}
 	}
 
-	sub.RemoveSubscribedTrack(subTrack)
-	sub.Negotiate()
+	go func() {
+		t.subscribedTracksMu.Lock()
+		delete(t.subscribedTracks, sub.ID())
+		t.subscribedTracksMu.Unlock()
+		subTrack.Close(isExpectedToResume)
+	}()
 }
